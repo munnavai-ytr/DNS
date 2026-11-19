@@ -1,0 +1,6 @@
+{
+  "name": "DNS Shield",
+  "description": "Local VPN-based DNS filter that blocks adult domains across all apps and browsers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,39 @@
+# DNS Shield seed blocklist
+# Supports plain domain-per-line or hosts-file format (0.0.0.0 / 127.0.0.1)
+
+# Self-test verification domain (must never contact external adult sites)
+blocktest.dnsshield.test
+
+# Seed adult domains
+pornhub.com
+xvideos.com
+xnxx.com
+xhamster.com
+redtube.com
+youporn.com
+tube8.com
+spankbang.com
+eporner.com
+beeg.com
+txxx.com
+hqporner.com
+chaturbate.com
+bongacams.com
+stripchat.com
+cam4.com
+livejasmin.com
+myfreecams.com
+onlyfans.com
+brazzers.com
+bangbros.com
+realitykings.com
+naughtyamerica.com
+blacked.com
+vixen.com
+tushy.com
+youjizz.com
+drtuber.com
+sunporno.com
+nuvid.com
+sex.com
+fapello.com

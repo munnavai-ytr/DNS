@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Bold geometric shield centered inside the 66dp adaptive safe zone -->
+    <path
+        android:fillColor="#00E5A3"
+        android:pathData="M54,24 L77,33.5 V52.5 C77,67.8 67.1,80.6 54,85 C40.9,80.6 31,67.8 31,52.5 V33.5 L54,24 Z" />
+    <!-- Inner dark shield cutout -->
+    <path
+        android:fillColor="#0B1322"
+        android:pathData="M54,30.2 L71,37.2 V52.2 C71,64.2 63.7,74.4 54,78.4 C44.3,74.4 37,64.2 37,52.2 V37.2 L54,30.2 Z" />
+    <!-- Protective check / DNS filter bolt inside the shield -->
+    <path
+        android:fillColor="#00E5A3"
+        android:pathData="M49.8,61.6 L42.8,54.6 L46.2,51.2 L49.8,54.8 L61.8,42.8 L65.2,46.2 L49.8,61.6 Z" />
+</vector>

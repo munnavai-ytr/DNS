@@ -1,0 +1,8 @@
+package com.example.data.local
+
+data class BlockedLogEntity(
+    val id: Long = 0,
+    val domain: String,
+    val queryType: String,
+    val timestamp: Long = System.currentTimeMillis(),
+)
