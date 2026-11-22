@@ -70,9 +70,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.protection.ProtectionLevel
+import com.example.protection.ProtectionMode
 import com.example.protection.ProtectionNotificationHelper
 import com.example.ui.theme.ShieldAmber
 import com.example.ui.theme.ShieldCoral
+import com.example.ui.theme.ShieldCyan
 import com.example.ui.theme.ShieldEmerald
 import com.example.ui.viewmodel.MainUiState
 import com.example.ui.viewmodel.SelfTestState
@@ -596,17 +598,30 @@ private fun ProtectionStatusCard(
                         contentDescription = null,
                         tint = accent,
                     )
-                    Text(
-                        text = stringResource(R.string.protection_card_title),
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
+                    Column {
+                        Text(
+                            text = stringResource(R.string.protection_card_title),
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "${tamper.protectionMode.label} • ${tamper.lockType.label}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = ShieldCyan,
+                        )
+                    }
                 }
                 ProtectionLevelBadge(level = level)
             }
 
             val summaryText =
                 when {
+                    tamper.isStrictLock && tamper.protectionSetupDone ->
+                        if (level == ProtectionLevel.WEAK) {
+                            "Strict Lock active — Protection weakened! Tap Fix Weakened to restore."
+                        } else {
+                            "Strict Lock active — No PIN or unlock path exists. Only a factory reset removes DNS Shield."
+                        }
                     tamper.isUnlockWindowActive -> {
                         val rem =
                             ProtectionNotificationHelper.formatDurationShort(
@@ -626,14 +641,25 @@ private fun ProtectionStatusCard(
                     level == ProtectionLevel.ON ->
                         "Tamper Guard ON • Wait time: ${tamper.waitDuration.label}"
                     level == ProtectionLevel.WEAK ->
-                        "Protection weakened. One or more required guards are disabled."
+                        "Protection weakened. One or more required protections need attention."
                     else ->
-                        "Complete PIN, Wait Time, Device Admin, and Accessibility Guard to turn ON."
+                        "Complete Steps 1-4 (Mode, Lock Type, Device Admin, Accessibility Guard) to turn ON."
                 }
 
             Text(
                 text = summaryText,
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Text(
+                text =
+                    if (tamper.protectionMode == ProtectionMode.PRIVATE_DNS) {
+                        "Private DNS Lite: AI check and custom block/whitelist rules do not apply."
+                    } else {
+                        "Note: Android allows only one VPN at a time; starting another VPN switches this one off."
+                    },
+                style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
@@ -658,55 +684,58 @@ private fun ProtectionStatusCard(
                     )
                 }
 
-                when {
-                    tamper.isUnlockWindowActive -> {
-                        Button(
-                            onClick = onLockAgain,
-                            modifier =
-                                Modifier.weight(1f)
-                                    .height(48.dp)
-                                    .testTag("protection_lock_again_button"),
-                            shape = RoundedCornerShape(12.dp),
-                        ) {
-                            Text(stringResource(R.string.lock_again_button), maxLines = 1)
+                if (!tamper.isStrictLock) {
+                    when {
+                        tamper.isUnlockWindowActive -> {
+                            Button(
+                                onClick = onLockAgain,
+                                modifier =
+                                    Modifier.weight(1f)
+                                        .height(48.dp)
+                                        .testTag("protection_lock_again_button"),
+                                shape = RoundedCornerShape(12.dp),
+                            ) {
+                                Text(stringResource(R.string.lock_again_button), maxLines = 1)
+                            }
                         }
-                    }
-                    tamper.isCountdownActive -> {
-                        OutlinedButton(
-                            onClick = onCancelTurnOffRequest,
-                            modifier =
-                                Modifier.weight(1f)
-                                    .height(48.dp)
-                                    .testTag("protection_cancel_request_button"),
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(1.dp, ShieldCoral.copy(alpha = 0.6f)),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = ShieldCoral),
-                        ) {
-                            Text(stringResource(R.string.cancel_request_button), maxLines = 1)
+                        tamper.isCountdownActive -> {
+                            OutlinedButton(
+                                onClick = onCancelTurnOffRequest,
+                                modifier =
+                                    Modifier.weight(1f)
+                                        .height(48.dp)
+                                        .testTag("protection_cancel_request_button"),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, ShieldCoral.copy(alpha = 0.6f)),
+                                colors =
+                                    ButtonDefaults.outlinedButtonColors(contentColor = ShieldCoral),
+                            ) {
+                                Text(stringResource(R.string.cancel_request_button), maxLines = 1)
+                            }
                         }
-                    }
-                    tamper.isCountdownReadyToUnlock -> {
-                        Button(
-                            onClick = onOpenUnlockFlow,
-                            modifier =
-                                Modifier.weight(1f)
-                                    .height(48.dp)
-                                    .testTag("protection_enter_pin_unlock_button"),
-                            shape = RoundedCornerShape(12.dp),
-                        ) {
-                            Text("Enter PIN", maxLines = 1)
+                        tamper.isCountdownReadyToUnlock -> {
+                            Button(
+                                onClick = onOpenUnlockFlow,
+                                modifier =
+                                    Modifier.weight(1f)
+                                        .height(48.dp)
+                                        .testTag("protection_enter_pin_unlock_button"),
+                                shape = RoundedCornerShape(12.dp),
+                            ) {
+                                Text("Enter PIN", maxLines = 1)
+                            }
                         }
-                    }
-                    tamper.protectionSetupDone -> {
-                        OutlinedButton(
-                            onClick = onOpenUnlockFlow,
-                            modifier =
-                                Modifier.weight(1f)
-                                    .height(48.dp)
-                                    .testTag("protection_request_turn_off_button"),
-                            shape = RoundedCornerShape(12.dp),
-                        ) {
-                            Text("Turn Off", maxLines = 1)
+                        tamper.protectionSetupDone -> {
+                            OutlinedButton(
+                                onClick = onOpenUnlockFlow,
+                                modifier =
+                                    Modifier.weight(1f)
+                                        .height(48.dp)
+                                        .testTag("protection_request_turn_off_button"),
+                                shape = RoundedCornerShape(12.dp),
+                            ) {
+                                Text("Turn Off", maxLines = 1)
+                            }
                         }
                     }
                 }

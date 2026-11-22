@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import com.example.DnsShieldApplication
+import com.example.protection.ProtectionMode
 import com.example.vpn.DnsVpnService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,12 +22,14 @@ class ServiceRestartReceiver : BroadcastReceiver() {
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val guardActive = app.repository.isGuardBlockingNow()
-                val shouldRun = guardActive || app.repository.isVpnDesiredEnabled()
+                val snapshot =
+                    app.repository.refreshProtectionState(restartVpnIfProtectedAndDown = false)
+                val isVpnMode = snapshot.tamperState.protectionMode == ProtectionMode.VPN
+                val shouldRun =
+                    isVpnMode &&
+                        (snapshot.tamperState.isGuardActive || app.repository.isVpnDesiredEnabled())
                 if (shouldRun && VpnService.prepare(context) == null) {
                     DnsVpnService.start(context)
-                } else {
-                    app.repository.refreshProtectionState(restartVpnIfProtectedAndDown = false)
                 }
             } catch (_: Throwable) {
                 // Ignore transient restart errors

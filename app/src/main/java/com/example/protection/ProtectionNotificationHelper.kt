@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
@@ -22,6 +23,10 @@ object ProtectionNotificationHelper {
 
     private const val NOTIFICATION_ID_TIMER = 1002
     private const val NOTIFICATION_ID_WEAKENED = 1003
+    private const val MIN_TIMER_NOTIFY_INTERVAL_MS = 5000L
+
+    @Volatile private var lastTimerNotifyElapsedMs = 0L
+    @Volatile private var lastTimerKey = ""
 
     fun ensureChannels(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
@@ -54,8 +59,40 @@ object ProtectionNotificationHelper {
         ensureChannels(context)
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
 
-        when {
-            state.isUnlockWindowActive -> {
+        if (state.isStrictLock) {
+            lastTimerKey = ""
+            manager.cancel(NOTIFICATION_ID_TIMER)
+            return
+        }
+
+        val modeKey =
+            when {
+                state.isUnlockWindowActive -> "UNLOCK"
+                state.isCountdownReadyToUnlock -> "READY"
+                state.isCountdownActive -> "COUNTDOWN"
+                else -> "NONE"
+            }
+
+        if (modeKey == "NONE") {
+            if (lastTimerKey.isNotEmpty()) {
+                lastTimerKey = ""
+                manager.cancel(NOTIFICATION_ID_TIMER)
+            }
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (
+            modeKey == lastTimerKey &&
+                now - lastTimerNotifyElapsedMs < MIN_TIMER_NOTIFY_INTERVAL_MS
+        ) {
+            return
+        }
+        lastTimerKey = modeKey
+        lastTimerNotifyElapsedMs = now
+
+        when (modeKey) {
+            "UNLOCK" -> {
                 val formatted = formatDurationShort(state.unlockWindowRemainingMs)
                 val openIntent = buildMainActivityIntent(context, DEST_UNLOCK, requestCode = 201)
                 val lockNowIntent =
@@ -86,7 +123,8 @@ object ProtectionNotificationHelper {
                 manager.notify(NOTIFICATION_ID_TIMER, notification)
             }
 
-            state.isCountdownActive || state.isCountdownReadyToUnlock -> {
+            "READY",
+            "COUNTDOWN" -> {
                 val openIntent = buildMainActivityIntent(context, DEST_UNLOCK, requestCode = 203)
                 val cancelIntent =
                     PendingIntent.getBroadcast(
@@ -128,10 +166,6 @@ object ProtectionNotificationHelper {
                         .build()
                 manager.notify(NOTIFICATION_ID_TIMER, notification)
             }
-
-            else -> {
-                manager.cancel(NOTIFICATION_ID_TIMER)
-            }
         }
     }
 
@@ -148,7 +182,12 @@ object ProtectionNotificationHelper {
         }
 
         val missing = buildList {
-            if (!checklist.vpnRunning) add("VPN filter")
+            if (checklist.protectionMode == ProtectionMode.VPN && !checklist.vpnRunning) {
+                add("VPN filter")
+            }
+            if (checklist.protectionMode == ProtectionMode.PRIVATE_DNS && !checklist.privateDnsConfigured) {
+                add("Private DNS (${ProtectionSystemChecker.PRIVATE_DNS_REQUIRED_HOSTNAME})")
+            }
             if (!checklist.deviceAdminEnabled) add("Device Admin")
             if (!checklist.accessibilityEnabled) add("Accessibility Guard")
         }
@@ -156,7 +195,7 @@ object ProtectionNotificationHelper {
             if (missing.isEmpty()) {
                 "One or more tamper protections need attention."
             } else {
-                "Disabled: ${missing.joinToString(", ")}"
+                "Needs attention: ${missing.joinToString(", ")}"
             }
 
         val tapIntent = buildMainActivityIntent(context, DEST_CHECKLIST, requestCode = 205)

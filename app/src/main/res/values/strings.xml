@@ -86,6 +86,7 @@
     <string name="device_admin_label">DNS Shield Uninstall Guard</string>
     <string name="device_admin_disable_warning">DNS Shield tamper protection is active. Disabling Device Admin weakens adult content protection.</string>
     <string name="protected_by_dns_shield">Protected by DNS Shield</string>
+    <string name="overlay_go_home">Go home</string>
     <string name="protection_card_title">Protection</string>
     <string name="protection_setup_title">Protection Setup</string>
     <string name="protection_checklist_title">Protection Status Checklist</string>

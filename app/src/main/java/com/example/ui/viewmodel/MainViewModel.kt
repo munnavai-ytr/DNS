@@ -19,6 +19,7 @@ import com.example.dns.UnsurePolicy
 import com.example.protection.PinActionResult
 import com.example.protection.ProtectionChecklistState
 import com.example.protection.ProtectionLevel
+import com.example.protection.ProtectionMode
 import com.example.protection.ProtectionNotificationHelper
 import com.example.protection.TamperProtectionState
 import com.example.protection.WaitDurationOption
@@ -107,6 +108,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val ruleFeedback = MutableStateFlow<String?>(null)
 
     init {
+        // Low-overhead timer refresh: only wakes every 5 seconds when a timer is active,
+        // avoiding unnecessary DataStore/Notification churn.
         viewModelScope.launch {
             var wasUnlockActive = false
             while (isActive) {
@@ -115,6 +118,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val hasActiveTimer =
                     state.isCountdownActive || state.isUnlockWindowActive || state.isLockedOut
                 if (hasActiveTimer) {
+                    val minRem =
+                        listOfNotNull(
+                                state.countdownRemainingMs.takeIf { state.isCountdownActive },
+                                state.unlockWindowRemainingMs.takeIf { state.isUnlockWindowActive },
+                                state.lockoutRemainingMs.takeIf { state.isLockedOut },
+                            )
+                            .minOrNull() ?: 5000L
+                    delay(minRem.coerceIn(1000L, 5000L))
                     val updated =
                         repository.refreshProtectionState(
                             restartVpnIfProtectedAndDown = wasUnlockActive
@@ -125,8 +136,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         repository.refreshProtectionState(restartVpnIfProtectedAndDown = true)
                     }
                     wasUnlockActive = false
+                    delay(5000L)
                 }
-                delay(1000L)
             }
         }
     }
@@ -208,6 +219,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startVpn() {
         viewModelScope.launch {
+            if (repository.getCachedProtectionMode() == ProtectionMode.PRIVATE_DNS) {
+                ruleFeedback.value =
+                    "Private DNS mode is active. Switch to VPN mode inside an unlock window to run the local VPN."
+                return@launch
+            }
             repository.setVpnDesiredEnabled(true)
             DnsVpnService.start(app)
         }
@@ -217,7 +233,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             if (repository.isGuardBlockingNow()) {
                 ruleFeedback.value =
-                    "Tamper protection is ON. Request to turn off protection first."
+                    if (repository.getCachedLockType().name == "STRICT_LOCK") {
+                        "Strict Lock is active. VPN cannot be turned off."
+                    } else {
+                        "Tamper protection is ON. Request to turn off protection first."
+                    }
                 return@launch
             }
             repository.setVpnDesiredEnabled(false)
@@ -229,7 +249,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun completeOnboarding(activateShield: Boolean) {
         viewModelScope.launch {
             repository.setOnboardingCompleted(true)
-            if (activateShield && VpnService.prepare(app) == null) {
+            if (
+                activateShield &&
+                    repository.getCachedProtectionMode() == ProtectionMode.VPN &&
+                    VpnService.prepare(app) == null
+            ) {
                 repository.setVpnDesiredEnabled(true)
                 DnsVpnService.start(app)
             }
@@ -241,8 +265,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.markWizardPromptedAfterOnboarding() }
     }
 
+    suspend fun selectProtectionMode(mode: ProtectionMode): WaitTimeUpdateResult {
+        return repository.setProtectionMode(mode)
+    }
+
     suspend fun setInitialPin(pin: String): PinActionResult {
         return repository.setInitialPin(pin)
+    }
+
+    suspend fun activateStrictLock(confirmationPhrase: String): PinActionResult {
+        return repository.activateStrictLock(confirmationPhrase)
     }
 
     suspend fun changePin(currentPin: String, newPin: String): PinActionResult {
@@ -284,7 +316,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val ok = repository.deactivateProtectionInUnlockWindow()
             ruleFeedback.value =
                 if (ok) "Tamper protection turned OFF"
-                else "Unlock protection first to deactivate it"
+                else "Cannot deactivate protection outside an active unlock window"
         }
     }
 
@@ -300,6 +332,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun runSelfTest() {
+        if (repository.getCachedProtectionMode() == ProtectionMode.PRIVATE_DNS) {
+            selfTestState.value =
+                SelfTestState.NotWorking(
+                    "Private DNS mode does not run the local VPN. Verify family.cloudflare-dns.com in your Protection Checklist."
+                )
+            return
+        }
         if (!repository.isVpnRunning.value) {
             selfTestState.value =
                 SelfTestState.NotWorking("DNS Shield is OFF. Turn it ON to test.")

@@ -5,6 +5,7 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.VpnService
 import android.os.PowerManager
@@ -12,6 +13,8 @@ import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
 
 object ProtectionSystemChecker {
+    const val PRIVATE_DNS_REQUIRED_HOSTNAME = "family.cloudflare-dns.com"
+
     fun isDeviceAdminActive(context: Context): Boolean {
         return runCatching {
                 val dpm = context.getSystemService(DevicePolicyManager::class.java) ?: return false
@@ -57,6 +60,22 @@ object ProtectionSystemChecker {
             .getOrDefault(false)
     }
 
+    fun isPrivateDnsConfigured(context: Context): Boolean {
+        return runCatching {
+                val mode =
+                    Settings.Global.getString(context.contentResolver, "private_dns_mode")
+                        ?.trim()
+                        .orEmpty()
+                val specifier =
+                    Settings.Global.getString(context.contentResolver, "private_dns_specifier")
+                        ?.trim()
+                        .orEmpty()
+                mode.equals("hostname", ignoreCase = true) &&
+                    specifier.equals(PRIVATE_DNS_REQUIRED_HOSTNAME, ignoreCase = true)
+            }
+            .getOrDefault(false)
+    }
+
     fun isBatteryOptimizationIgnored(context: Context): Boolean {
         return runCatching {
                 val pm = context.getSystemService(PowerManager::class.java) ?: return false
@@ -67,6 +86,17 @@ object ProtectionSystemChecker {
 
     fun hasVpnPermission(context: Context): Boolean {
         return runCatching { VpnService.prepare(context) == null }.getOrDefault(false)
+    }
+
+    fun getDefaultLauncherPackage(context: Context): String? {
+        return runCatching {
+                val intent =
+                    Intent(Intent.ACTION_MAIN).apply { addCategory(Intent.CATEGORY_HOME) }
+                val resolved =
+                    context.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+                resolved?.activityInfo?.packageName
+            }
+            .getOrNull()
     }
 
     fun buildDeviceAdminIntent(context: Context): Intent {
@@ -92,6 +122,10 @@ object ProtectionSystemChecker {
 
     fun buildVpnSettingsIntent(): Intent {
         return Intent(Settings.ACTION_VPN_SETTINGS)
+    }
+
+    fun buildNetworkSettingsIntent(): Intent {
+        return Intent(Settings.ACTION_WIRELESS_SETTINGS)
     }
 
     fun buildBatteryOptimizationIntent(context: Context): Intent {

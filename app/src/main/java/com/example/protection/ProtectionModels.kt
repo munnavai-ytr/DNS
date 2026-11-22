@@ -2,6 +2,29 @@ package com.example.protection
 
 import android.os.SystemClock
 
+enum class ProtectionMode(val label: String) {
+    VPN("VPN Mode"),
+    PRIVATE_DNS("Private DNS Mode (Lite)");
+
+    companion object {
+        fun fromStored(raw: String?): ProtectionMode {
+            return entries.firstOrNull { it.name == raw } ?: VPN
+        }
+    }
+}
+
+enum class LockType(val label: String) {
+    NONE("Not Configured"),
+    TRUSTED_PIN("Trusted PIN"),
+    STRICT_LOCK("Strict Lock");
+
+    companion object {
+        fun fromStored(raw: String?): LockType {
+            return entries.firstOrNull { it.name == raw } ?: NONE
+        }
+    }
+}
+
 enum class WaitDurationOption(val durationMs: Long, val label: String) {
     TEN_MINUTES(10L * 60L * 1000L, "10 minutes (Testing)"),
     ONE_HOUR(60L * 60L * 1000L, "1 hour"),
@@ -24,34 +47,52 @@ enum class ProtectionLevel {
 }
 
 data class ProtectionChecklistState(
+    val protectionMode: ProtectionMode = ProtectionMode.VPN,
+    val modeConfigured: Boolean = false,
+    val lockType: LockType = LockType.NONE,
     val pinConfigured: Boolean = false,
     val waitDurationConfigured: Boolean = false,
     val deviceAdminEnabled: Boolean = false,
     val accessibilityEnabled: Boolean = false,
     val vpnRunning: Boolean = false,
     val vpnAlwaysOn: Boolean = false,
-    val vpnLockdownEnabled: Boolean = false,
+    val privateDnsConfigured: Boolean = false,
     val batteryOptimizationIgnored: Boolean = false,
 ) {
+    val isLockStepComplete: Boolean
+        get() =
+            when (lockType) {
+                LockType.TRUSTED_PIN -> pinConfigured && waitDurationConfigured
+                LockType.STRICT_LOCK -> true
+                LockType.NONE -> false
+            }
+
     /**
-     * Core tamper protection counts as ON only after steps 1-4 are done:
-     * 1. PIN configured
-     * 2. Wait time configured
+     * Protection counts as ON only after Steps 1-4 are done:
+     * 1. Protection Mode configured
+     * 2. Lock Type configured (Trusted PIN + wait time, or Strict Lock)
      * 3. Device Admin active
      * 4. Accessibility Guard enabled
      */
     val isCoreStepsComplete: Boolean
         get() =
-            pinConfigured &&
-                waitDurationConfigured &&
+            modeConfigured &&
+                isLockStepComplete &&
                 deviceAdminEnabled &&
                 accessibilityEnabled
 
-    val isAlwaysOnAndLockdownOk: Boolean
-        get() = vpnAlwaysOn && vpnLockdownEnabled
+    val isModeActiveOk: Boolean
+        get() =
+            when (protectionMode) {
+                ProtectionMode.VPN -> vpnRunning
+                ProtectionMode.PRIVATE_DNS -> privateDnsConfigured
+            }
 }
 
 data class TamperProtectionState(
+    val protectionMode: ProtectionMode = ProtectionMode.VPN,
+    val modeConfigured: Boolean = false,
+    val lockType: LockType = LockType.NONE,
     val isPinConfigured: Boolean = false,
     val protectionSetupDone: Boolean = false,
     val waitDuration: WaitDurationOption = WaitDurationOption.DEFAULT,
@@ -66,11 +107,23 @@ data class TamperProtectionState(
     val failedPinAttempts: Int = 0,
     val lockoutTier: Int = 0,
 ) {
+    val isStrictLock: Boolean
+        get() = lockType == LockType.STRICT_LOCK
+
     val isGuardActive: Boolean
-        get() = protectionSetupDone && !isUnlockWindowActive
+        get() =
+            protectionSetupDone &&
+                (lockType == LockType.STRICT_LOCK || !isUnlockWindowActive)
 
     val canTurnOffVpnDirectly: Boolean
-        get() = !protectionSetupDone || isUnlockWindowActive
+        get() =
+            !protectionSetupDone ||
+                (lockType == LockType.TRUSTED_PIN && isUnlockWindowActive)
+
+    val canChangeLockOrMode: Boolean
+        get() =
+            !protectionSetupDone ||
+                (lockType == LockType.TRUSTED_PIN && isUnlockWindowActive)
 }
 
 sealed interface PinActionResult {

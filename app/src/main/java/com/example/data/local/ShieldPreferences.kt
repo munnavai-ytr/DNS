@@ -12,7 +12,9 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.dns.GeminiDomainClassifier
 import com.example.dns.UnsurePolicy
+import com.example.protection.LockType
 import com.example.protection.PersistedTamperState
+import com.example.protection.ProtectionMode
 import com.example.protection.ProtectionStateStore
 import com.example.protection.WaitDurationOption
 import java.io.IOException
@@ -50,6 +52,9 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
         val WHEN_UNSURE = stringPreferencesKey("when_unsure")
 
         // V3 Tamper Protection keys
+        val PROTECTION_MODE = stringPreferencesKey("tamper_protection_mode")
+        val MODE_EXPLICITLY_CHOSEN = booleanPreferencesKey("tamper_mode_explicitly_chosen")
+        val LOCK_TYPE = stringPreferencesKey("tamper_lock_type")
         val PIN_SALT_BASE64 = stringPreferencesKey("tamper_pin_salt")
         val PIN_HASH_BASE64 = stringPreferencesKey("tamper_pin_hash")
         val WAIT_DURATION_MS = longPreferencesKey("tamper_wait_duration_ms")
@@ -101,13 +106,6 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
                 )
             }
 
-    val tamperStateFlow: Flow<PersistedTamperState> =
-        context.shieldDataStore.data
-            .catch { exception ->
-                if (exception is IOException) emit(emptyPreferences()) else throw exception
-            }
-            .map { prefs -> mapToTamperState(prefs) }
-
     override suspend fun readState(): PersistedTamperState {
         val prefs =
             context.shieldDataStore.data
@@ -120,6 +118,9 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
 
     override suspend fun writeState(state: PersistedTamperState) {
         context.shieldDataStore.edit { prefs ->
+            prefs[Keys.PROTECTION_MODE] = state.protectionModeName
+            prefs[Keys.MODE_EXPLICITLY_CHOSEN] = state.modeExplicitlyChosen
+            prefs[Keys.LOCK_TYPE] = state.lockTypeName
             prefs[Keys.PIN_SALT_BASE64] = state.pinSaltBase64
             prefs[Keys.PIN_HASH_BASE64] = state.pinHashBase64
             prefs[Keys.WAIT_DURATION_MS] = state.waitDurationMs
@@ -141,6 +142,9 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
 
     private fun mapToTamperState(prefs: Preferences): PersistedTamperState {
         return PersistedTamperState(
+            protectionModeName = prefs[Keys.PROTECTION_MODE] ?: ProtectionMode.VPN.name,
+            modeExplicitlyChosen = prefs[Keys.MODE_EXPLICITLY_CHOSEN] ?: false,
+            lockTypeName = prefs[Keys.LOCK_TYPE] ?: LockType.NONE.name,
             pinSaltBase64 = prefs[Keys.PIN_SALT_BASE64] ?: "",
             pinHashBase64 = prefs[Keys.PIN_HASH_BASE64] ?: "",
             waitDurationMs = prefs[Keys.WAIT_DURATION_MS] ?: WaitDurationOption.DEFAULT.durationMs,
@@ -190,7 +194,8 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
         context.shieldDataStore.edit { prefs -> prefs[Keys.WHEN_UNSURE] = policy.name }
     }
 
-    suspend fun incrementBlockedCounters() {
+    suspend fun incrementBlockedCountersBy(delta: Long) {
+        if (delta <= 0L) return
         val currentEpochDay = LocalDate.now().toEpochDay()
         context.shieldDataStore.edit { prefs ->
             val storedDay = prefs[Keys.BLOCKED_TODAY_EPOCH_DAY] ?: currentEpochDay
@@ -202,8 +207,8 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
                 }
             val previousTotal = prefs[Keys.TOTAL_BLOCKED] ?: 0L
             prefs[Keys.BLOCKED_TODAY_EPOCH_DAY] = currentEpochDay
-            prefs[Keys.BLOCKED_TODAY] = previousToday + 1L
-            prefs[Keys.TOTAL_BLOCKED] = previousTotal + 1L
+            prefs[Keys.BLOCKED_TODAY] = previousToday + delta
+            prefs[Keys.TOTAL_BLOCKED] = previousTotal + delta
         }
     }
 }

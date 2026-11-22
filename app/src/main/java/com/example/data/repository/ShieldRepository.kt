@@ -16,9 +16,11 @@ import com.example.dns.DomainFilterEngine
 import com.example.dns.GeminiDomainClassifier
 import com.example.dns.UnsurePolicy
 import com.example.dns.VerdictCache
+import com.example.protection.LockType
 import com.example.protection.PinActionResult
 import com.example.protection.ProtectionChecklistState
 import com.example.protection.ProtectionLevel
+import com.example.protection.ProtectionMode
 import com.example.protection.ProtectionNotificationHelper
 import com.example.protection.ProtectionSystemChecker
 import com.example.protection.ProtectionWatchdogScheduler
@@ -30,13 +32,17 @@ import com.example.vpn.DnsVpnService
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class ProtectionUiSnapshot(
     val tamperState: TamperProtectionState = TamperProtectionState(),
@@ -62,8 +68,16 @@ class ShieldRepository(
 
     val tamperEngine = TamperProtectionEngine(store = preferences)
 
+    // Batched log & counter buffer (flush every 5s or 20 items)
+    private val logBatchMutex = Mutex()
+    private val pendingLogs = ArrayList<BlockedLogEntity>(LOG_BATCH_LIMIT)
+    private var pendingCounterDelta = 0L
+    private var flushTimerJob: Job? = null
+
     // Fast volatile cache so AccessibilityService and DnsVpnService never block on disk I/O
     @Volatile private var cachedProtectionActivated = false
+    @Volatile private var cachedProtectionMode = ProtectionMode.VPN
+    @Volatile private var cachedLockType = LockType.NONE
     @Volatile private var cachedUnlockEndElapsedMs = 0L
 
     val decisionEngine: DnsDecisionEngine =
@@ -78,7 +92,6 @@ class ShieldRepository(
     val isVpnRunning: StateFlow<Boolean> = _isVpnRunning.asStateFlow()
 
     private val _isVpnAlwaysOn = MutableStateFlow(false)
-    private val _isVpnLockdownEnabled = MutableStateFlow(false)
 
     private val _protectionUiSnapshot = MutableStateFlow(ProtectionUiSnapshot())
     val protectionUiSnapshot: StateFlow<ProtectionUiSnapshot> = _protectionUiSnapshot.asStateFlow()
@@ -135,8 +148,13 @@ class ShieldRepository(
 
     fun getCurrentModel(): String = currentModelRef.get()
 
+    fun getCachedProtectionMode(): ProtectionMode = cachedProtectionMode
+
+    fun getCachedLockType(): LockType = cachedLockType
+
     fun isGuardBlockingNowSync(): Boolean {
         if (!cachedProtectionActivated) return false
+        if (cachedLockType == LockType.STRICT_LOCK) return true
         val unlockEnd = cachedUnlockEndElapsedMs
         return unlockEnd == 0L || SystemClock.elapsedRealtime() >= unlockEnd
     }
@@ -147,18 +165,39 @@ class ShieldRepository(
         return state.isGuardActive
     }
 
-    suspend fun refreshProtectionState(restartVpnIfProtectedAndDown: Boolean = false): ProtectionUiSnapshot {
+    suspend fun refreshProtectionState(
+        restartVpnIfProtectedAndDown: Boolean = false
+    ): ProtectionUiSnapshot {
         DnsVpnService.refreshFlagsIfRunning()
         val rawBeforeSync = tamperEngine.getRawState()
-        val checklistBefore = buildChecklist(rawBeforeSync.pinHashBase64.isNotBlank(), rawBeforeSync.waitDurationExplicitlyChosen || rawBeforeSync.protectionActivated)
+        val modeBefore = ProtectionMode.fromStored(rawBeforeSync.protectionModeName)
+        val lockBefore = LockType.fromStored(rawBeforeSync.lockTypeName)
+
+        val checklistBefore =
+            buildChecklist(
+                mode = modeBefore,
+                modeConfigured =
+                    rawBeforeSync.modeExplicitlyChosen || rawBeforeSync.protectionActivated,
+                lockType = lockBefore,
+                pinConfigured = rawBeforeSync.pinHashBase64.isNotBlank(),
+                waitConfigured =
+                    rawBeforeSync.waitDurationExplicitlyChosen ||
+                        rawBeforeSync.protectionActivated ||
+                        rawBeforeSync.pinHashBase64.isNotBlank(),
+            )
         val syncedState = tamperEngine.syncCoreProtectionActivation(checklistBefore.isCoreStepsComplete)
         val rawAfterSync = tamperEngine.getRawState()
 
         val checklist =
             buildChecklist(
+                mode = syncedState.protectionMode,
+                modeConfigured = syncedState.modeConfigured,
+                lockType = syncedState.lockType,
                 pinConfigured = syncedState.isPinConfigured,
                 waitConfigured =
-                    rawAfterSync.waitDurationExplicitlyChosen || syncedState.protectionSetupDone || syncedState.isPinConfigured,
+                    rawAfterSync.waitDurationExplicitlyChosen ||
+                        syncedState.protectionSetupDone ||
+                        syncedState.isPinConfigured,
             )
         val level = tamperEngine.computeProtectionLevel(checklist, syncedState)
         val snapshot =
@@ -180,6 +219,7 @@ class ShieldRepository(
 
         if (
             restartVpnIfProtectedAndDown &&
+                syncedState.protectionMode == ProtectionMode.VPN &&
                 syncedState.isGuardActive &&
                 !checklist.vpnRunning &&
                 ProtectionSystemChecker.hasVpnPermission(appContext)
@@ -191,25 +231,37 @@ class ShieldRepository(
     }
 
     private fun buildChecklist(
+        mode: ProtectionMode,
+        modeConfigured: Boolean,
+        lockType: LockType,
         pinConfigured: Boolean,
         waitConfigured: Boolean,
     ): ProtectionChecklistState {
         return ProtectionChecklistState(
+            protectionMode = mode,
+            modeConfigured = modeConfigured,
+            lockType = lockType,
             pinConfigured = pinConfigured,
             waitDurationConfigured = waitConfigured,
             deviceAdminEnabled = ProtectionSystemChecker.isDeviceAdminActive(appContext),
             accessibilityEnabled = ProtectionSystemChecker.isAccessibilityGuardEnabled(appContext),
             vpnRunning = _isVpnRunning.value,
             vpnAlwaysOn = _isVpnAlwaysOn.value,
-            vpnLockdownEnabled = _isVpnLockdownEnabled.value,
+            privateDnsConfigured = ProtectionSystemChecker.isPrivateDnsConfigured(appContext),
             batteryOptimizationIgnored = ProtectionSystemChecker.isBatteryOptimizationIgnored(appContext),
         )
     }
 
     private fun updateFastGuardCache(state: TamperProtectionState) {
         cachedProtectionActivated = state.protectionSetupDone
+        cachedProtectionMode = state.protectionMode
+        cachedLockType = state.lockType
         cachedUnlockEndElapsedMs =
-            if (state.isUnlockWindowActive && state.unlockWindowRemainingMs > 0L) {
+            if (
+                state.lockType == LockType.TRUSTED_PIN &&
+                    state.isUnlockWindowActive &&
+                    state.unlockWindowRemainingMs > 0L
+            ) {
                 SystemClock.elapsedRealtime() + state.unlockWindowRemainingMs
             } else {
                 0L
@@ -221,8 +273,25 @@ class ShieldRepository(
         refreshProtectionState(restartVpnIfProtectedAndDown = false)
     }
 
+    suspend fun setProtectionMode(mode: ProtectionMode): WaitTimeUpdateResult {
+        val result = tamperEngine.setProtectionMode(mode)
+        if (result == WaitTimeUpdateResult.Success && mode == ProtectionMode.PRIVATE_DNS) {
+            // Private DNS mode runs no local VPN
+            preferences.setVpnDesiredEnabled(false)
+            DnsVpnService.stop(appContext)
+        }
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return result
+    }
+
     suspend fun setInitialPin(pin: String): PinActionResult {
         val result = tamperEngine.setInitialPin(pin)
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return result
+    }
+
+    suspend fun activateStrictLock(confirmationPhrase: String): PinActionResult {
+        val result = tamperEngine.activateStrictLock(confirmationPhrase)
         refreshProtectionState(restartVpnIfProtectedAndDown = false)
         return result
     }
@@ -294,11 +363,9 @@ class ShieldRepository(
         }
     }
 
-    fun updateVpnSecurityFlags(alwaysOn: Boolean, lockdownEnabled: Boolean) {
-        val changed =
-            _isVpnAlwaysOn.value != alwaysOn || _isVpnLockdownEnabled.value != lockdownEnabled
+    fun updateVpnAlwaysOn(alwaysOn: Boolean) {
+        val changed = _isVpnAlwaysOn.value != alwaysOn
         _isVpnAlwaysOn.value = alwaysOn
-        _isVpnLockdownEnabled.value = lockdownEnabled
         if (changed) {
             repoScope.launch { refreshProtectionState(restartVpnIfProtectedAndDown = false) }
         }
@@ -351,8 +418,7 @@ class ShieldRepository(
         reason: BlockReason,
         durationMs: Long,
     ) {
-        preferences.incrementBlockedCounters()
-        database.insertAndTrimLog(
+        val entry =
             BlockedLogEntity(
                 domain = domain,
                 queryType = queryType,
@@ -360,7 +426,59 @@ class ShieldRepository(
                 durationMs = durationMs,
                 timestamp = System.currentTimeMillis(),
             )
-        )
+        var immediateFlushEntries: List<BlockedLogEntity>? = null
+        var immediateCounterDelta = 0L
+
+        logBatchMutex.withLock {
+            pendingLogs.add(entry)
+            pendingCounterDelta += 1L
+            if (pendingLogs.size >= LOG_BATCH_LIMIT) {
+                immediateFlushEntries = pendingLogs.toList()
+                pendingLogs.clear()
+                immediateCounterDelta = pendingCounterDelta
+                pendingCounterDelta = 0L
+                flushTimerJob?.cancel()
+                flushTimerJob = null
+            } else if (flushTimerJob?.isActive != true) {
+                flushTimerJob =
+                    repoScope.launch {
+                        delay(LOG_FLUSH_INTERVAL_MS)
+                        flushPendingBlockedLogs()
+                    }
+            }
+        }
+
+        val batch = immediateFlushEntries
+        if (batch != null) {
+            persistBatch(batch, immediateCounterDelta)
+        }
+    }
+
+    suspend fun flushPendingBlockedLogs() {
+        var batch: List<BlockedLogEntity> = emptyList()
+        var delta = 0L
+        logBatchMutex.withLock {
+            flushTimerJob?.cancel()
+            flushTimerJob = null
+            if (pendingLogs.isNotEmpty() || pendingCounterDelta > 0L) {
+                batch = pendingLogs.toList()
+                pendingLogs.clear()
+                delta = pendingCounterDelta
+                pendingCounterDelta = 0L
+            }
+        }
+        if (batch.isNotEmpty() || delta > 0L) {
+            persistBatch(batch, delta)
+        }
+    }
+
+    private suspend fun persistBatch(entries: List<BlockedLogEntity>, counterDelta: Long) {
+        if (counterDelta > 0L) {
+            preferences.incrementBlockedCountersBy(counterDelta)
+        }
+        if (entries.isNotEmpty()) {
+            database.insertLogsBatchAndTrim(entries)
+        }
     }
 
     suspend fun addCustomRule(rawInput: String, isWhitelist: Boolean): Boolean {
@@ -380,6 +498,17 @@ class ShieldRepository(
     }
 
     suspend fun clearLogs() {
+        logBatchMutex.withLock {
+            pendingLogs.clear()
+            pendingCounterDelta = 0L
+            flushTimerJob?.cancel()
+            flushTimerJob = null
+        }
         database.clearLogs()
+    }
+
+    companion object {
+        private const val LOG_BATCH_LIMIT = 20
+        private const val LOG_FLUSH_INTERVAL_MS = 5000L
     }
 }

@@ -839,47 +839,79 @@ private fun TamperProtectionSettingsCard(
                             color = MaterialTheme.colorScheme.onSurface,
                         )
                         Text(
-                            text = "PIN lock, cooling-off timer, Device Admin & Guard",
+                            text = "${tamper.protectionMode.label} • ${tamper.lockType.label}",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = ShieldCyan,
                         )
                     }
                 }
                 ProtectionLevelBadge(level = uiState.protectionLevel)
             }
 
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(
-                    text = "Cooling-off wait time (raising allowed anytime; lowering only when unlocked)",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+            if (tamper.protectionMode == com.example.protection.ProtectionMode.PRIVATE_DNS) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = ShieldAmber.copy(alpha = 0.14f),
+                    border = BorderStroke(1.dp, ShieldAmber.copy(alpha = 0.4f)),
                 ) {
-                    WaitDurationOption.entries.forEach { option ->
-                        FilterChip(
-                            selected = tamper.waitDuration == option,
-                            onClick = {
-                                scope.launch {
-                                    when (val res = onSelectWaitDuration(option)) {
-                                        WaitTimeUpdateResult.Success ->
-                                            onShowFeedback("Wait time updated to ${option.label}")
-                                        is WaitTimeUpdateResult.Rejected ->
-                                            onShowFeedback(res.reason)
+                    Text(
+                        text =
+                            "Private DNS mode is active. AI verification, custom blocklist, and whitelist rules below apply only in VPN Mode.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = ShieldAmber,
+                        modifier = Modifier.padding(12.dp),
+                    )
+                }
+            }
+
+            if (tamper.isStrictLock && tamper.protectionSetupDone) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = ShieldCoral.copy(alpha = 0.14f),
+                    border = BorderStroke(1.dp, ShieldCoral.copy(alpha = 0.45f)),
+                ) {
+                    Text(
+                        text =
+                            "Strict Lock is active. There is no PIN, cooling-off timer, or unlock path. Mode and lock type cannot be changed; only a factory reset removes DNS Shield.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = ShieldCoral,
+                        modifier = Modifier.padding(12.dp),
+                    )
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = "Cooling-off wait time (raising allowed anytime; lowering only when unlocked)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        WaitDurationOption.entries.forEach { option ->
+                            FilterChip(
+                                selected = tamper.waitDuration == option,
+                                onClick = {
+                                    scope.launch {
+                                        when (val res = onSelectWaitDuration(option)) {
+                                            WaitTimeUpdateResult.Success ->
+                                                onShowFeedback("Wait time updated to ${option.label}")
+                                            is WaitTimeUpdateResult.Rejected ->
+                                                onShowFeedback(res.reason)
+                                        }
                                     }
-                                }
-                            },
-                            label = { Text(option.label) },
-                            colors =
-                                FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = ShieldEmerald.copy(alpha = 0.2f),
-                                    selectedLabelColor = ShieldEmerald,
-                                ),
-                            modifier = Modifier.testTag("settings_wait_${option.name}"),
-                        )
+                                },
+                                label = { Text(option.label) },
+                                colors =
+                                    FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = ShieldEmerald.copy(alpha = 0.2f),
+                                        selectedLabelColor = ShieldEmerald,
+                                    ),
+                                modifier = Modifier.testTag("settings_wait_${option.name}"),
+                            )
+                        }
                     }
                 }
             }
@@ -899,7 +931,7 @@ private fun TamperProtectionSettingsCard(
                     Text("Setup & Checklist", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
 
-                if (tamper.isPinConfigured) {
+                if (!tamper.isStrictLock && tamper.isPinConfigured) {
                     OutlinedButton(
                         onClick = {
                             if (tamper.protectionSetupDone && !tamper.isUnlockWindowActive) {
@@ -921,7 +953,12 @@ private fun TamperProtectionSettingsCard(
                 }
             }
 
-            if (tamper.protectionSetupDone || tamper.isUnlockWindowActive || tamper.isCountdownActive) {
+            if (
+                !tamper.isStrictLock &&
+                    (tamper.protectionSetupDone ||
+                        tamper.isUnlockWindowActive ||
+                        tamper.isCountdownActive)
+            ) {
                 Button(
                     onClick = onOpenUnlockFlow,
                     modifier =

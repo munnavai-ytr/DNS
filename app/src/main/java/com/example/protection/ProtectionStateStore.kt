@@ -1,6 +1,9 @@
 package com.example.protection
 
 data class PersistedTamperState(
+    val protectionModeName: String = ProtectionMode.VPN.name,
+    val modeExplicitlyChosen: Boolean = false,
+    val lockTypeName: String = LockType.NONE.name,
     val pinSaltBase64: String = "",
     val pinHashBase64: String = "",
     val waitDurationMs: Long = WaitDurationOption.DEFAULT.durationMs,

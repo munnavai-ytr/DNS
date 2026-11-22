@@ -75,20 +75,27 @@ class DnsShieldDatabase private constructor(context: Context) :
         withContext(Dispatchers.IO) { dbMutex.withLock { queryAllRulesSync() } }
 
     suspend fun insertAndTrimLog(entry: BlockedLogEntity) {
+        insertLogsBatchAndTrim(listOf(entry))
+    }
+
+    suspend fun insertLogsBatchAndTrim(entries: List<BlockedLogEntity>) {
+        if (entries.isEmpty()) return
         withContext(Dispatchers.IO) {
             dbMutex.withLock {
                 val db = writableDatabase
                 db.beginTransaction()
                 try {
-                    val values =
-                        ContentValues().apply {
-                            put("domain", entry.domain)
-                            put("query_type", entry.queryType)
-                            put("reason", entry.reason)
-                            put("duration_ms", entry.durationMs)
-                            put("timestamp", entry.timestamp)
-                        }
-                    db.insert(TABLE_LOGS, null, values)
+                    for (entry in entries) {
+                        val values =
+                            ContentValues().apply {
+                                put("domain", entry.domain)
+                                put("query_type", entry.queryType)
+                                put("reason", entry.reason)
+                                put("duration_ms", entry.durationMs)
+                                put("timestamp", entry.timestamp)
+                            }
+                        db.insert(TABLE_LOGS, null, values)
+                    }
                     db.execSQL(
                         """
                         DELETE FROM $TABLE_LOGS

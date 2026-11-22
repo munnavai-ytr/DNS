@@ -1,11 +1,13 @@
 package com.example
 
 import com.example.protection.InMemoryProtectionStateStore
+import com.example.protection.LockType
 import com.example.protection.PinActionResult
 import com.example.protection.PinHasher
 import com.example.protection.ProtectionChecklistState
 import com.example.protection.ProtectionClock
 import com.example.protection.ProtectionLevel
+import com.example.protection.ProtectionMode
 import com.example.protection.TamperProtectionEngine
 import com.example.protection.WaitDurationOption
 import com.example.protection.WaitTimeUpdateResult
@@ -46,9 +48,11 @@ class TamperProtectionTest {
 
     private suspend fun setupActivatedProtection(
         engine: TamperProtectionEngine,
+        mode: ProtectionMode = ProtectionMode.VPN,
         pin: String = "482913",
         waitDuration: WaitDurationOption = WaitDurationOption.TEN_MINUTES,
     ) {
+        assertEquals(WaitTimeUpdateResult.Success, engine.setProtectionMode(mode))
         assertEquals(PinActionResult.Success, engine.setInitialPin(pin))
         assertEquals(WaitTimeUpdateResult.Success, engine.setWaitDuration(waitDuration))
         engine.syncCoreProtectionActivation(coreStepsComplete = true)
@@ -222,43 +226,134 @@ class TamperProtectionTest {
         assertTrue(lowerRejected is WaitTimeUpdateResult.Rejected)
         assertEquals(WaitDurationOption.TWENTY_FOUR_HOURS, engine.getState().waitDuration)
 
-        // Changing PIN outside unlock window is also rejected
+        // Changing PIN or Protection Mode outside unlock window is also rejected
         assertTrue(engine.changePin("987654", "111222") is PinActionResult.Rejected)
+        assertTrue(engine.setProtectionMode(ProtectionMode.PRIVATE_DNS) is WaitTimeUpdateResult.Rejected)
 
         // Complete unlock flow to enter 15-minute unlock window
         assertEquals(PinActionResult.Success, engine.requestTurnOffProtection("987654"))
         clock.advanceBy(24L * 60 * 60_000L)
         assertEquals(PinActionResult.Success, engine.confirmUnlockWindow("987654"))
 
-        // Inside unlock window: lowering wait time AND changing PIN succeed
+        // Inside unlock window: lowering wait time, changing PIN, and switching mode succeed
         assertEquals(
             WaitTimeUpdateResult.Success,
             engine.setWaitDuration(WaitDurationOption.TEN_MINUTES),
         )
         assertEquals(WaitDurationOption.TEN_MINUTES, engine.getState().waitDuration)
         assertEquals(PinActionResult.Success, engine.changePin("987654", "111222"))
+        assertEquals(
+            WaitTimeUpdateResult.Success,
+            engine.setProtectionMode(ProtectionMode.PRIVATE_DNS),
+        )
+        assertEquals(ProtectionMode.PRIVATE_DNS, engine.getState().protectionMode)
     }
 
     @Test
-    fun computeProtectionLevel_reflectsOnWeakOffCorrectly() = runBlocking {
+    fun strictLock_requiresExactPhraseAndHasNoUnlockPathAtAll() = runBlocking {
         val clock = FakeProtectionClock()
         val engine = TamperProtectionEngine(InMemoryProtectionStateStore(), clock)
-        setupActivatedProtection(engine, pin = "223344", waitDuration = WaitDurationOption.TEN_MINUTES)
+        assertEquals(WaitTimeUpdateResult.Success, engine.setProtectionMode(ProtectionMode.VPN))
 
-        val fullChecklist =
+        // Reject wrong confirmation phrase
+        assertTrue(engine.activateStrictLock("i understand") is PinActionResult.Rejected)
+        assertTrue(engine.activateStrictLock("YES") is PinActionResult.Rejected)
+
+        // Accept exact phrase "I UNDERSTAND"
+        assertEquals(
+            PinActionResult.Success,
+            engine.activateStrictLock(TamperProtectionEngine.STRICT_LOCK_CONFIRMATION_PHRASE),
+        )
+        engine.syncCoreProtectionActivation(coreStepsComplete = true)
+
+        val lockedState = engine.getState()
+        assertEquals(LockType.STRICT_LOCK, lockedState.lockType)
+        assertTrue(lockedState.isStrictLock)
+        assertTrue(lockedState.isGuardActive)
+        assertFalse(lockedState.isPinConfigured)
+        assertFalse(lockedState.canTurnOffVpnDirectly)
+        assertFalse(lockedState.canChangeLockOrMode)
+
+        // No unlock path, PIN change, wait change, mode change, or deactivation is ever allowed
+        assertTrue(engine.requestTurnOffProtection("000000") is PinActionResult.Rejected)
+        assertTrue(engine.confirmUnlockWindow("000000") is PinActionResult.Rejected)
+        assertTrue(engine.setInitialPin("123456") is PinActionResult.Rejected)
+        assertTrue(engine.changePin("000000", "123456") is PinActionResult.Rejected)
+        assertTrue(
+            engine.setWaitDuration(WaitDurationOption.SEVENTY_TWO_HOURS)
+                is WaitTimeUpdateResult.Rejected
+        )
+        assertTrue(engine.setProtectionMode(ProtectionMode.PRIVATE_DNS) is WaitTimeUpdateResult.Rejected)
+        assertFalse(engine.deactivateProtectionInUnlockWindow())
+
+        // Even after advancing days, guard stays permanently active
+        clock.advanceBy(7L * 24L * 60L * 60_000L)
+        val stillLocked = engine.getState()
+        assertTrue(stillLocked.isGuardActive)
+        assertFalse(stillLocked.isUnlockWindowActive)
+        assertFalse(stillLocked.isCountdownActive)
+    }
+
+    @Test
+    fun computeProtectionLevel_reflectsVpnAndPrivateDnsModesCorrectly() = runBlocking {
+        val clock = FakeProtectionClock()
+        val engine = TamperProtectionEngine(InMemoryProtectionStateStore(), clock)
+        setupActivatedProtection(
+            engine,
+            mode = ProtectionMode.VPN,
+            pin = "223344",
+            waitDuration = WaitDurationOption.TEN_MINUTES,
+        )
+
+        val vpnChecklist =
             ProtectionChecklistState(
+                protectionMode = ProtectionMode.VPN,
+                modeConfigured = true,
+                lockType = LockType.TRUSTED_PIN,
                 pinConfigured = true,
                 waitDurationConfigured = true,
                 deviceAdminEnabled = true,
                 accessibilityEnabled = true,
                 vpnRunning = true,
             )
-        assertEquals(ProtectionLevel.ON, engine.computeProtectionLevel(fullChecklist, engine.getState()))
+        assertEquals(ProtectionLevel.ON, engine.computeProtectionLevel(vpnChecklist, engine.getState()))
 
-        val weakenedChecklist = fullChecklist.copy(accessibilityEnabled = false)
+        val weakenedVpnChecklist = vpnChecklist.copy(accessibilityEnabled = false)
         assertEquals(
             ProtectionLevel.WEAK,
-            engine.computeProtectionLevel(weakenedChecklist, engine.getState()),
+            engine.computeProtectionLevel(weakenedVpnChecklist, engine.getState()),
+        )
+
+        // Switch to Private DNS mode in a fresh instance
+        val privateDnsEngine = TamperProtectionEngine(InMemoryProtectionStateStore(), clock)
+        setupActivatedProtection(
+            privateDnsEngine,
+            mode = ProtectionMode.PRIVATE_DNS,
+            pin = "223344",
+            waitDuration = WaitDurationOption.TEN_MINUTES,
+        )
+        val privateDnsChecklist =
+            ProtectionChecklistState(
+                protectionMode = ProtectionMode.PRIVATE_DNS,
+                modeConfigured = true,
+                lockType = LockType.TRUSTED_PIN,
+                pinConfigured = true,
+                waitDurationConfigured = true,
+                deviceAdminEnabled = true,
+                accessibilityEnabled = true,
+                vpnRunning = false,
+                privateDnsConfigured = true,
+            )
+        assertEquals(
+            ProtectionLevel.ON,
+            privateDnsEngine.computeProtectionLevel(privateDnsChecklist, privateDnsEngine.getState()),
+        )
+        assertEquals(
+            ProtectionLevel.WEAK,
+            privateDnsEngine.computeProtectionLevel(
+                privateDnsChecklist.copy(privateDnsConfigured = false),
+                privateDnsEngine.getState(),
+            ),
         )
     }
 }

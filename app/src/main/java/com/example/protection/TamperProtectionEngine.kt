@@ -26,12 +26,41 @@ class TamperProtectionEngine(
             }
         }
 
+    suspend fun setProtectionMode(mode: ProtectionMode): WaitTimeUpdateResult =
+        mutex.withLock {
+            val synced = syncTimeLocked(store.readState())
+            val lockType = LockType.fromStored(synced.lockTypeName)
+            if (synced.protectionActivated && lockType == LockType.STRICT_LOCK) {
+                return@withLock WaitTimeUpdateResult.Rejected(
+                    "Strict Lock is active. Protection mode cannot be changed."
+                )
+            }
+            if (synced.protectionActivated && !synced.unlockWindowActive) {
+                return@withLock WaitTimeUpdateResult.Rejected(
+                    "Protection mode can only be changed during an active 15-minute unlock window."
+                )
+            }
+            store.writeState(
+                synced.copy(
+                    protectionModeName = mode.name,
+                    modeExplicitlyChosen = true,
+                )
+            )
+            WaitTimeUpdateResult.Success
+        }
+
     suspend fun setInitialPin(pin: String): PinActionResult =
         mutex.withLock {
             if (!PinHasher.isValidPinFormat(pin)) {
                 return@withLock PinActionResult.Rejected("PIN must be 6 digits.")
             }
             val synced = syncTimeLocked(store.readState())
+            val lockType = LockType.fromStored(synced.lockTypeName)
+            if (synced.protectionActivated && lockType == LockType.STRICT_LOCK) {
+                return@withLock PinActionResult.Rejected(
+                    "Strict Lock is permanent. Lock type and PIN cannot be set or changed."
+                )
+            }
             if (synced.protectionActivated && !synced.unlockWindowActive) {
                 return@withLock PinActionResult.Rejected(
                     "PIN can only be changed during an active 15-minute unlock window."
@@ -40,8 +69,44 @@ class TamperProtectionEngine(
             val (salt, hash) = PinHasher.hashPin(pin)
             val updated =
                 synced.copy(
+                    lockTypeName = LockType.TRUSTED_PIN.name,
                     pinSaltBase64 = salt,
                     pinHashBase64 = hash,
+                    failedPinAttempts = 0,
+                    lockoutTier = 0,
+                    lockoutRemainingMs = 0L,
+                )
+            store.writeState(updated)
+            PinActionResult.Success
+        }
+
+    suspend fun activateStrictLock(confirmationPhrase: String): PinActionResult =
+        mutex.withLock {
+            val synced = syncTimeLocked(store.readState())
+            val currentLock = LockType.fromStored(synced.lockTypeName)
+            if (synced.protectionActivated && currentLock == LockType.STRICT_LOCK) {
+                return@withLock PinActionResult.Rejected("Strict Lock is already active.")
+            }
+            if (synced.protectionActivated && !synced.unlockWindowActive) {
+                return@withLock PinActionResult.Rejected(
+                    "Lock type can only be changed during an active 15-minute unlock window."
+                )
+            }
+            if (confirmationPhrase.trim() != STRICT_LOCK_CONFIRMATION_PHRASE) {
+                return@withLock PinActionResult.Rejected(
+                    "Type exact phrase \"$STRICT_LOCK_CONFIRMATION_PHRASE\" to confirm Strict Lock."
+                )
+            }
+            val updated =
+                synced.copy(
+                    lockTypeName = LockType.STRICT_LOCK.name,
+                    pinSaltBase64 = "",
+                    pinHashBase64 = "",
+                    countdownActive = false,
+                    countdownRemainingMs = 0L,
+                    countdownReadyForSecondPin = false,
+                    unlockWindowActive = false,
+                    unlockWindowRemainingMs = 0L,
                     failedPinAttempts = 0,
                     lockoutTier = 0,
                     lockoutRemainingMs = 0L,
@@ -53,6 +118,11 @@ class TamperProtectionEngine(
     suspend fun changePin(currentPin: String, newPin: String): PinActionResult =
         mutex.withLock {
             val synced = syncTimeLocked(store.readState())
+            if (LockType.fromStored(synced.lockTypeName) == LockType.STRICT_LOCK) {
+                return@withLock PinActionResult.Rejected(
+                    "Strict Lock has no PIN and no unlock path."
+                )
+            }
             if (synced.pinHashBase64.isBlank()) {
                 return@withLock PinActionResult.Rejected("No PIN is currently configured.")
             }
@@ -86,6 +156,14 @@ class TamperProtectionEngine(
     suspend fun setWaitDuration(option: WaitDurationOption): WaitTimeUpdateResult =
         mutex.withLock {
             val synced = syncTimeLocked(store.readState())
+            if (
+                synced.protectionActivated &&
+                    LockType.fromStored(synced.lockTypeName) == LockType.STRICT_LOCK
+            ) {
+                return@withLock WaitTimeUpdateResult.Rejected(
+                    "Strict Lock has no unlock path or cooling-off wait time."
+                )
+            }
             val isLowering = option.durationMs < synced.waitDurationMs
             if (isLowering && synced.protectionActivated && !synced.unlockWindowActive) {
                 return@withLock WaitTimeUpdateResult.Rejected(
@@ -130,6 +208,11 @@ class TamperProtectionEngine(
     suspend fun requestTurnOffProtection(pin: String): PinActionResult =
         mutex.withLock {
             val synced = syncTimeLocked(store.readState())
+            if (LockType.fromStored(synced.lockTypeName) == LockType.STRICT_LOCK) {
+                return@withLock PinActionResult.Rejected(
+                    "Strict Lock is permanent. There is no unlock path; only a factory reset removes DNS Shield."
+                )
+            }
             if (synced.pinHashBase64.isBlank()) {
                 return@withLock PinActionResult.Rejected("Protection PIN is not set.")
             }
@@ -158,6 +241,11 @@ class TamperProtectionEngine(
     suspend fun confirmUnlockWindow(pin: String): PinActionResult =
         mutex.withLock {
             val synced = syncTimeLocked(store.readState())
+            if (LockType.fromStored(synced.lockTypeName) == LockType.STRICT_LOCK) {
+                return@withLock PinActionResult.Rejected(
+                    "Strict Lock has no unlock path."
+                )
+            }
             if (!synced.countdownReadyForSecondPin) {
                 return@withLock PinActionResult.Rejected(
                     if (synced.countdownActive) {
@@ -217,6 +305,9 @@ class TamperProtectionEngine(
     suspend fun deactivateProtectionInUnlockWindow(): Boolean =
         mutex.withLock {
             val synced = syncTimeLocked(store.readState())
+            if (LockType.fromStored(synced.lockTypeName) == LockType.STRICT_LOCK) {
+                return@withLock false
+            }
             if (synced.protectionActivated && !synced.unlockWindowActive) {
                 return@withLock false
             }
@@ -240,10 +331,10 @@ class TamperProtectionEngine(
         if (!state.protectionSetupDone && !checklist.isCoreStepsComplete) {
             return ProtectionLevel.OFF
         }
-        if (state.isUnlockWindowActive) {
+        if (state.lockType == LockType.TRUSTED_PIN && state.isUnlockWindowActive) {
             return ProtectionLevel.OFF
         }
-        return if (checklist.isCoreStepsComplete && checklist.vpnRunning) {
+        return if (checklist.isCoreStepsComplete && checklist.isModeActiveOk) {
             ProtectionLevel.ON
         } else {
             ProtectionLevel.WEAK
@@ -289,10 +380,6 @@ class TamperProtectionEngine(
         val prevHighestWall = raw.highestWallClockMs
         val newHighestWall = maxOf(prevHighestWall, wallNow)
 
-        // Same boot: rely purely on monotonic elapsedRealtime() so neither moving the system
-        // clock backwards nor jumping it forwards can shorten any timer.
-        // Across a reboot (elapsedNow < lastElapsedRealtimeMs): rely on highest-seen wall clock
-        // delta (or elapsedNow if the wall clock was rewound before reboot).
         val advanceMs =
             if (elapsedNow >= raw.lastElapsedRealtimeMs) {
                 elapsedNow - raw.lastElapsedRealtimeMs
@@ -327,6 +414,15 @@ class TamperProtectionEngine(
             }
         }
 
+        val lockType = LockType.fromStored(raw.lockTypeName)
+        if (lockType == LockType.STRICT_LOCK) {
+            nextCountdownActive = false
+            nextCountdownRem = 0L
+            nextCountdownReady = false
+            nextUnlockActive = false
+            nextUnlockRem = 0L
+        }
+
         val synced =
             raw.copy(
                 highestWallClockMs = newHighestWall,
@@ -346,32 +442,39 @@ class TamperProtectionEngine(
     }
 
     private fun toPublicState(raw: PersistedTamperState): TamperProtectionState {
+        val mode = ProtectionMode.fromStored(raw.protectionModeName)
+        val lockType = LockType.fromStored(raw.lockTypeName)
+        val isStrict = lockType == LockType.STRICT_LOCK
         return TamperProtectionState(
+            protectionMode = mode,
+            modeConfigured = raw.modeExplicitlyChosen || raw.protectionActivated,
+            lockType = lockType,
             isPinConfigured = raw.pinHashBase64.isNotBlank(),
             protectionSetupDone = raw.protectionActivated,
             waitDuration = WaitDurationOption.fromDurationMs(raw.waitDurationMs),
             protectionLevel =
-                if (raw.protectionActivated && !raw.unlockWindowActive) {
+                if (raw.protectionActivated && (isStrict || !raw.unlockWindowActive)) {
                     ProtectionLevel.ON
                 } else {
                     ProtectionLevel.OFF
                 },
-            isCountdownActive = raw.countdownActive,
-            countdownRemainingMs = raw.countdownRemainingMs,
-            isCountdownReadyToUnlock = raw.countdownReadyForSecondPin,
-            isUnlockWindowActive = raw.unlockWindowActive,
-            unlockWindowRemainingMs = raw.unlockWindowRemainingMs,
-            isLockedOut = raw.lockoutRemainingMs > 0L,
-            lockoutRemainingMs = raw.lockoutRemainingMs,
-            failedPinAttempts = raw.failedPinAttempts,
-            lockoutTier = raw.lockoutTier,
+            isCountdownActive = !isStrict && raw.countdownActive,
+            countdownRemainingMs = if (isStrict) 0L else raw.countdownRemainingMs,
+            isCountdownReadyToUnlock = !isStrict && raw.countdownReadyForSecondPin,
+            isUnlockWindowActive = !isStrict && raw.unlockWindowActive,
+            unlockWindowRemainingMs = if (isStrict) 0L else raw.unlockWindowRemainingMs,
+            isLockedOut = !isStrict && raw.lockoutRemainingMs > 0L,
+            lockoutRemainingMs = if (isStrict) 0L else raw.lockoutRemainingMs,
+            failedPinAttempts = if (isStrict) 0 else raw.failedPinAttempts,
+            lockoutTier = if (isStrict) 0 else raw.lockoutTier,
         )
     }
 
     companion object {
+        const val STRICT_LOCK_CONFIRMATION_PHRASE = "I UNDERSTAND"
         const val MAX_FAILED_PIN_ATTEMPTS = 5
         const val BASE_LOCKOUT_DURATION_MS = 30L * 60L * 1000L
         const val UNLOCK_WINDOW_DURATION_MS = 15L * 60L * 1000L
-        private const val MAX_LOCKOUT_SHIFT = 6 // caps at 30m * 64 = 32 hours
+        private const val MAX_LOCKOUT_SHIFT = 6
     }
 }

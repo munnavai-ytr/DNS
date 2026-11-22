@@ -314,7 +314,9 @@ private fun DnsShieldApp(
             checklist = uiState.checklistState,
             protectionLevel = uiState.protectionLevel,
             initialShowChecklistOnly = wizardOpenChecklistFirst,
+            onSelectProtectionMode = { mode -> viewModel.selectProtectionMode(mode) },
             onSaveInitialPin = { pin -> viewModel.setInitialPin(pin) },
+            onActivateStrictLock = { phrase -> viewModel.activateStrictLock(phrase) },
             onSelectWaitDuration = { option -> viewModel.selectWaitDuration(option) },
             onConfirmWaitDurationStep = { viewModel.confirmWaitDurationStep() },
             onRequestDeviceAdmin = {
@@ -335,6 +337,15 @@ private fun DnsShieldApp(
             onOpenVpnSettings = {
                 runCatching {
                     settingsLauncher.launch(ProtectionSystemChecker.buildVpnSettingsIntent())
+                }
+            },
+            onOpenNetworkSettings = {
+                runCatching {
+                    settingsLauncher.launch(ProtectionSystemChecker.buildNetworkSettingsIntent())
+                }.onFailure {
+                    runCatching {
+                        settingsLauncher.launch(Intent(Settings.ACTION_SETTINGS))
+                    }
                 }
             },
             onRequestBatteryOptimization = requestBatteryOptimization,
@@ -427,8 +438,15 @@ private fun DnsShieldApp(
                         ShieldScreen(
                             uiState = uiState,
                             onToggleVpn = {
-                                if (uiState.isVpnRunning) {
-                                    if (!uiState.tamperState.canTurnOffVpnDirectly) {
+                                if (uiState.tamperState.protectionMode == com.example.protection.ProtectionMode.PRIVATE_DNS) {
+                                    wizardOpenChecklistFirst = true
+                                    showProtectionWizard = true
+                                } else if (uiState.isVpnRunning) {
+                                    if (uiState.tamperState.isStrictLock && uiState.tamperState.protectionSetupDone) {
+                                        viewModel.showFeedback(
+                                            "Strict Lock is active. VPN cannot be turned off."
+                                        )
+                                    } else if (!uiState.tamperState.canTurnOffVpnDirectly) {
                                         showUnlockDialog = true
                                     } else {
                                         viewModel.stopVpn()
