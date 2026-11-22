@@ -35,7 +35,8 @@ class DnsShieldDatabase private constructor(context: Context) :
                 query_type TEXT NOT NULL,
                 reason TEXT NOT NULL DEFAULT 'Blocklist',
                 duration_ms INTEGER NOT NULL DEFAULT 0,
-                timestamp INTEGER NOT NULL
+                timestamp INTEGER NOT NULL,
+                package_name TEXT NOT NULL DEFAULT ''
             )
             """.trimIndent()
         )
@@ -62,6 +63,13 @@ class DnsShieldDatabase private constructor(context: Context) :
             runCatching {
                 db.execSQL(
                     "ALTER TABLE $TABLE_LOGS ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+        if (oldVersion < 3) {
+            runCatching {
+                db.execSQL(
+                    "ALTER TABLE $TABLE_LOGS ADD COLUMN package_name TEXT NOT NULL DEFAULT ''"
                 )
             }
         }
@@ -93,6 +101,7 @@ class DnsShieldDatabase private constructor(context: Context) :
                                 put("reason", entry.reason)
                                 put("duration_ms", entry.durationMs)
                                 put("timestamp", entry.timestamp)
+                                put("package_name", entry.packageName)
                             }
                         db.insert(TABLE_LOGS, null, values)
                     }
@@ -155,7 +164,7 @@ class DnsShieldDatabase private constructor(context: Context) :
         val result = ArrayList<BlockedLogEntity>(MAX_LOG_ENTRIES)
         readableDatabase
             .rawQuery(
-                "SELECT id, domain, query_type, reason, duration_ms, timestamp FROM $TABLE_LOGS ORDER BY timestamp DESC, id DESC LIMIT $MAX_LOG_ENTRIES",
+                "SELECT id, domain, query_type, reason, duration_ms, timestamp, package_name FROM $TABLE_LOGS ORDER BY timestamp DESC, id DESC LIMIT $MAX_LOG_ENTRIES",
                 null,
             )
             .use { cursor ->
@@ -165,6 +174,7 @@ class DnsShieldDatabase private constructor(context: Context) :
                 val reasonIdx = cursor.getColumnIndexOrThrow("reason")
                 val durationIdx = cursor.getColumnIndexOrThrow("duration_ms")
                 val tsIdx = cursor.getColumnIndexOrThrow("timestamp")
+                val pkgIdx = cursor.getColumnIndexOrThrow("package_name")
                 while (cursor.moveToNext()) {
                     result.add(
                         BlockedLogEntity(
@@ -174,6 +184,7 @@ class DnsShieldDatabase private constructor(context: Context) :
                             reason = cursor.getString(reasonIdx),
                             durationMs = cursor.getLong(durationIdx),
                             timestamp = cursor.getLong(tsIdx),
+                            packageName = cursor.getString(pkgIdx),
                         )
                     )
                 }
@@ -207,7 +218,7 @@ class DnsShieldDatabase private constructor(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "dns_shield.db"
-        private const val DATABASE_VERSION = 2
+        private const val DATABASE_VERSION = 3
         private const val TABLE_LOGS = "blocked_logs"
         private const val TABLE_RULES = "custom_rules"
         private const val MAX_LOG_ENTRIES = 200

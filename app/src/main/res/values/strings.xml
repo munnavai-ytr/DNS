@@ -38,6 +38,8 @@
     <string name="notification_countdown_ready_title">Cooling-off countdown complete</string>
     <string name="notification_countdown_ready_desc">Tap to enter your PIN and open the 15-minute unlock window</string>
     <string name="notification_unlock_title">DNS Shield Unlocked (15-min window)</string>
+    <string name="notification_relocked_title">Protection locked again</string>
+    <string name="notification_relocked_desc">Your 15-minute unlock window ended. Tamper Guard is active again.</string>
     <string name="notification_weakened_title">Protection weakened, tap to fix</string>
 
     <!-- Logs Screen -->
@@ -94,4 +96,12 @@
     <string name="cancel_request_button">Cancel request</string>
     <string name="lock_again_button">Lock again</string>
     <string name="change_pin_button">Change PIN</string>
+
+    <!-- V4 Screen Guard -->
+    <string name="screen_guard_title">Screen Guard</string>
+    <string name="screen_guard_blocked_overlay">Blocked by DNS Shield: adult content</string>
+    <string name="screen_guard_cooldown_title">Cool down active</string>
+    <string name="screen_guard_privacy_statement">Screen text is analyzed on this phone only and is never saved or sent anywhere. Only the optional visual check (OFF by default) sends screenshots.</string>
+    <string name="screen_guard_visual_warning">When ON, small screenshots of monitored apps are sent to the Gemini API for adult-content classification. Screenshots are never stored. Free API tiers may allow Google to use submitted content to improve its products; read the terms before enabling.</string>
+    <string name="screen_guard_test_button">Test Screen Guard</string>
 </resources>

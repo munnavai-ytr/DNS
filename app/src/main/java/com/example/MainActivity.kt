@@ -13,27 +13,42 @@ import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.automirrored.outlined.ListAlt
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -42,6 +57,7 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -50,11 +66,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -168,6 +187,7 @@ private fun DnsShieldApp(
     var wizardOpenChecklistFirst by remember { mutableStateOf(false) }
     var showUnlockDialog by remember { mutableStateOf(false) }
     var showChangePinDialog by remember { mutableStateOf(false) }
+    var showScreenGuardTestScreen by remember { mutableStateOf(false) }
 
     var notificationsGranted by remember {
         mutableStateOf(
@@ -361,6 +381,16 @@ private fun DnsShieldApp(
         return
     }
 
+    if (showScreenGuardTestScreen) {
+        ScreenGuardTestScreen(
+            accessibilityEnabled = uiState.checklistState.accessibilityEnabled,
+            screenGuardEnabled = uiState.screenGuardSettings.masterEnabled,
+            onSetTestScreenOpen = { open -> viewModel.setScreenGuardTestScreenOpen(open) },
+            onBack = { showScreenGuardTestScreen = false },
+        )
+        return
+    }
+
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route ?: ROUTE_SHIELD
@@ -477,6 +507,7 @@ private fun DnsShieldApp(
                         LogsScreen(
                             logs = uiState.logs,
                             onWhitelistDomain = { domain -> viewModel.whitelistFromLog(domain) },
+                            onAllowApp = { pkg -> viewModel.addScreenGuardAllowedApp(pkg) },
                             onClearLogs = { viewModel.clearLogs() },
                         )
                     }
@@ -508,6 +539,34 @@ private fun DnsShieldApp(
                             onOpenChangePin = { showChangePinDialog = true },
                             onSelectWaitDuration = { option -> viewModel.selectWaitDuration(option) },
                             onShowFeedback = { msg -> viewModel.showFeedback(msg) },
+                            onToggleScreenGuardMaster = { enabled ->
+                                viewModel.setScreenGuardMasterEnabled(enabled)
+                            },
+                            onToggleScreenGuardUrlCheck = { enabled ->
+                                viewModel.setScreenGuardUrlCheckEnabled(enabled)
+                            },
+                            onToggleScreenGuardTextScoring = { enabled ->
+                                viewModel.setScreenGuardTextScoringEnabled(enabled)
+                            },
+                            onToggleScreenGuardSearchGuard = { enabled ->
+                                viewModel.setScreenGuardSearchGuardEnabled(enabled)
+                            },
+                            onToggleScreenGuardVisualCheck = { enabled ->
+                                viewModel.setScreenGuardVisualCheckEnabled(enabled)
+                            },
+                            onSelectScreenGuardSensitivity = { sens ->
+                                viewModel.setScreenGuardSensitivity(sens)
+                            },
+                            onToggleScreenGuardMonitorAllApps = { enabled ->
+                                viewModel.setScreenGuardMonitorAllApps(enabled)
+                            },
+                            onAddScreenGuardAllowedApp = { pkg ->
+                                viewModel.addScreenGuardAllowedApp(pkg)
+                            },
+                            onRemoveScreenGuardAllowedApp = { pkg ->
+                                viewModel.removeScreenGuardAllowedApp(pkg)
+                            },
+                            onOpenScreenGuardTest = { showScreenGuardTestScreen = true },
                         )
                     }
                 }
@@ -535,5 +594,110 @@ private fun DnsShieldApp(
             formatError = { res -> viewModel.formatActionError(res) },
             onDismiss = { showChangePinDialog = false },
         )
+    }
+}
+
+@Composable
+private fun ScreenGuardTestScreen(
+    accessibilityEnabled: Boolean,
+    screenGuardEnabled: Boolean,
+    onSetTestScreenOpen: (Boolean) -> Unit,
+    onBack: () -> Unit,
+) {
+    BackHandler { onBack() }
+
+    DisposableEffect(Unit) {
+        onSetTestScreenOpen(true)
+        onDispose { onSetTestScreenOpen(false) }
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding(),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Column(
+            modifier =
+                Modifier.fillMaxSize()
+                    .widthIn(max = 600.dp)
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier.testTag("screen_guard_test_back"),
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back",
+                    )
+                }
+                Text(
+                    text = "Screen Guard Live Test",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(
+                        text =
+                            if (!accessibilityEnabled) {
+                                "DNS Shield Guard accessibility service is currently OFF. Enable it in Setup & Checklist so Screen Guard can detect the test keyword below."
+                            } else if (!screenGuardEnabled) {
+                                "Screen Guard is currently OFF. Turn ON the master Screen Guard switch to test detection."
+                            } else {
+                                "Screen Guard is scanning this screen now. When detected, it will show the block overlay, navigate back, and record a test block in Blocked Log."
+                            },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = "Test Keyword Payload",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = com.example.protection.TextContentScorer.TEST_KEYWORD,
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.testTag("screen_guard_test_payload"),
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Button(
+                        onClick = onBack,
+                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text("Return to Settings")
+                    }
+                }
+            }
+        }
     }
 }

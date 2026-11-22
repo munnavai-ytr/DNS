@@ -24,11 +24,16 @@ import com.example.protection.ProtectionMode
 import com.example.protection.ProtectionNotificationHelper
 import com.example.protection.ProtectionSystemChecker
 import com.example.protection.ProtectionWatchdogScheduler
+import com.example.protection.ScreenGuardBlockReason
+import com.example.protection.ScreenGuardSensitivity
+import com.example.protection.ScreenGuardSettings
 import com.example.protection.TamperProtectionEngine
 import com.example.protection.TamperProtectionState
+import com.example.protection.TextContentScorer
 import com.example.protection.WaitDurationOption
 import com.example.protection.WaitTimeUpdateResult
 import com.example.vpn.DnsVpnService
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -67,8 +72,10 @@ class ShieldRepository(
     private val currentDecisionSettingsRef = AtomicReference(DecisionSettings())
 
     val tamperEngine = TamperProtectionEngine(store = preferences)
+    val textContentScorer = TextContentScorer()
 
     // Batched log & counter buffer (flush every 5s or 20 items)
+    private val refreshMutex = Mutex()
     private val logBatchMutex = Mutex()
     private val pendingLogs = ArrayList<BlockedLogEntity>(LOG_BATCH_LIMIT)
     private var pendingCounterDelta = 0L
@@ -79,6 +86,9 @@ class ShieldRepository(
     @Volatile private var cachedProtectionMode = ProtectionMode.VPN
     @Volatile private var cachedLockType = LockType.NONE
     @Volatile private var cachedUnlockEndElapsedMs = 0L
+    @Volatile private var cachedScreenGuardSettings = ScreenGuardSettings()
+    @Volatile private var lastScreenGuardHeartbeatElapsedMs = 0L
+    @Volatile private var screenGuardTestScreenOpen = false
 
     val decisionEngine: DnsDecisionEngine =
         DnsDecisionEngine(
@@ -118,6 +128,7 @@ class ShieldRepository(
         repoScope.launch {
             _baseRuleCount.value = filterEngine.loadBaseBlocklistFromAssets(appContext)
             _safeRuleCount.value = filterEngine.loadSafeDomainsFromAssets(appContext)
+            textContentScorer.loadFromAssets(appContext)
             verdictCache.loadFromDisk()
             refreshProtectionState(restartVpnIfProtectedAndDown = false)
             ProtectionWatchdogScheduler.ensurePeriodicWatchdog(appContext)
@@ -133,6 +144,7 @@ class ShieldRepository(
             preferences.snapshotFlow.collect { snapshot ->
                 currentApiKeyRef.set(snapshot.geminiApiKey)
                 currentModelRef.set(snapshot.geminiModel)
+                cachedScreenGuardSettings = snapshot.screenGuardSettings
                 currentDecisionSettingsRef.set(
                     DecisionSettings(
                         aiVerificationEnabled = snapshot.aiVerificationEnabled,
@@ -152,6 +164,23 @@ class ShieldRepository(
 
     fun getCachedLockType(): LockType = cachedLockType
 
+    fun getCachedScreenGuardSettings(): ScreenGuardSettings = cachedScreenGuardSettings
+
+    fun markScreenGuardHeartbeat() {
+        lastScreenGuardHeartbeatElapsedMs = SystemClock.elapsedRealtime()
+    }
+
+    fun isScreenGuardRecentlyActive(): Boolean {
+        val last = lastScreenGuardHeartbeatElapsedMs
+        return last > 0L && (SystemClock.elapsedRealtime() - last) <= SCREEN_GUARD_RECENT_WINDOW_MS
+    }
+
+    fun setScreenGuardTestScreenOpen(open: Boolean) {
+        screenGuardTestScreenOpen = open
+    }
+
+    fun isScreenGuardTestScreenOpen(): Boolean = screenGuardTestScreenOpen
+
     fun isGuardBlockingNowSync(): Boolean {
         if (!cachedProtectionActivated) return false
         if (cachedLockType == LockType.STRICT_LOCK) return true
@@ -167,68 +196,77 @@ class ShieldRepository(
 
     suspend fun refreshProtectionState(
         restartVpnIfProtectedAndDown: Boolean = false
-    ): ProtectionUiSnapshot {
-        DnsVpnService.refreshFlagsIfRunning()
-        val rawBeforeSync = tamperEngine.getRawState()
-        val modeBefore = ProtectionMode.fromStored(rawBeforeSync.protectionModeName)
-        val lockBefore = LockType.fromStored(rawBeforeSync.lockTypeName)
+    ): ProtectionUiSnapshot =
+        refreshMutex.withLock {
+            DnsVpnService.refreshFlagsIfRunning()
+            val rawBeforeSync = tamperEngine.getRawState()
+            val modeBefore = ProtectionMode.fromStored(rawBeforeSync.protectionModeName)
+            val lockBefore = LockType.fromStored(rawBeforeSync.lockTypeName)
 
-        val checklistBefore =
-            buildChecklist(
-                mode = modeBefore,
-                modeConfigured =
-                    rawBeforeSync.modeExplicitlyChosen || rawBeforeSync.protectionActivated,
-                lockType = lockBefore,
-                pinConfigured = rawBeforeSync.pinHashBase64.isNotBlank(),
-                waitConfigured =
-                    rawBeforeSync.waitDurationExplicitlyChosen ||
-                        rawBeforeSync.protectionActivated ||
-                        rawBeforeSync.pinHashBase64.isNotBlank(),
-            )
-        val syncedState = tamperEngine.syncCoreProtectionActivation(checklistBefore.isCoreStepsComplete)
-        val rawAfterSync = tamperEngine.getRawState()
+            val checklistBefore =
+                buildChecklist(
+                    mode = modeBefore,
+                    modeConfigured =
+                        rawBeforeSync.modeExplicitlyChosen || rawBeforeSync.protectionActivated,
+                    lockType = lockBefore,
+                    pinConfigured = rawBeforeSync.pinHashBase64.isNotBlank(),
+                    waitConfigured =
+                        rawBeforeSync.waitDurationExplicitlyChosen ||
+                            rawBeforeSync.protectionActivated ||
+                            rawBeforeSync.pinHashBase64.isNotBlank(),
+                )
+            val syncedState =
+                tamperEngine.syncCoreProtectionActivation(checklistBefore.isCoreStepsComplete)
+            val rawAfterSync = tamperEngine.getRawState()
+            val transitions = tamperEngine.consumePendingTransitions()
 
-        val checklist =
-            buildChecklist(
-                mode = syncedState.protectionMode,
-                modeConfigured = syncedState.modeConfigured,
-                lockType = syncedState.lockType,
-                pinConfigured = syncedState.isPinConfigured,
-                waitConfigured =
-                    rawAfterSync.waitDurationExplicitlyChosen ||
-                        syncedState.protectionSetupDone ||
-                        syncedState.isPinConfigured,
-            )
-        val level = tamperEngine.computeProtectionLevel(checklist, syncedState)
-        val snapshot =
-            ProtectionUiSnapshot(
-                tamperState = syncedState,
-                checklist = checklist,
-                protectionLevel = level,
-                wizardPromptedAfterOnboarding = rawAfterSync.wizardPromptedAfterOnboarding,
-            )
+            val checklist =
+                buildChecklist(
+                    mode = syncedState.protectionMode,
+                    modeConfigured = syncedState.modeConfigured,
+                    lockType = syncedState.lockType,
+                    pinConfigured = syncedState.isPinConfigured,
+                    waitConfigured =
+                        rawAfterSync.waitDurationExplicitlyChosen ||
+                            syncedState.protectionSetupDone ||
+                            syncedState.isPinConfigured,
+                )
+            val level = tamperEngine.computeProtectionLevel(checklist, syncedState)
+            val snapshot =
+                ProtectionUiSnapshot(
+                    tamperState = syncedState,
+                    checklist = checklist,
+                    protectionLevel = level,
+                    wizardPromptedAfterOnboarding = rawAfterSync.wizardPromptedAfterOnboarding,
+                )
 
-        updateFastGuardCache(syncedState)
-        _protectionUiSnapshot.value = snapshot
+            updateFastGuardCache(syncedState)
+            _protectionUiSnapshot.value = snapshot
 
-        ProtectionNotificationHelper.syncTimerNotification(appContext, syncedState)
-        ProtectionNotificationHelper.syncWeakenedNotification(appContext, level, checklist)
-        ProtectionWatchdogScheduler.ensurePeriodicWatchdog(appContext)
-        ProtectionWatchdogScheduler.syncBoundaryTimer(appContext, syncedState)
-        DnsVpnService.refreshNotificationIfRunning(appContext)
+            ProtectionNotificationHelper.syncTimerNotification(appContext, syncedState)
+            if (transitions.countdownCompleted) {
+                ProtectionNotificationHelper.postCountdownReadyAlert(appContext)
+            }
+            if (transitions.unlockWindowEnded) {
+                ProtectionNotificationHelper.postProtectionLockedAgainAlert(appContext)
+            }
+            ProtectionNotificationHelper.syncWeakenedNotification(appContext, level, checklist)
+            ProtectionWatchdogScheduler.ensurePeriodicWatchdog(appContext)
+            ProtectionWatchdogScheduler.syncBoundaryTimer(appContext, syncedState)
+            DnsVpnService.refreshNotificationIfRunning(appContext)
 
-        if (
-            restartVpnIfProtectedAndDown &&
-                syncedState.protectionMode == ProtectionMode.VPN &&
-                syncedState.isGuardActive &&
-                !checklist.vpnRunning &&
-                ProtectionSystemChecker.hasVpnPermission(appContext)
-        ) {
-            preferences.setVpnDesiredEnabled(true)
-            DnsVpnService.start(appContext)
+            if (
+                restartVpnIfProtectedAndDown &&
+                    syncedState.protectionMode == ProtectionMode.VPN &&
+                    syncedState.isGuardActive &&
+                    !checklist.vpnRunning &&
+                    ProtectionSystemChecker.hasVpnPermission(appContext)
+            ) {
+                preferences.setVpnDesiredEnabled(true)
+                DnsVpnService.start(appContext)
+            }
+            snapshot
         }
-        return snapshot
-    }
 
     private fun buildChecklist(
         mode: ProtectionMode,
@@ -237,6 +275,8 @@ class ShieldRepository(
         pinConfigured: Boolean,
         waitConfigured: Boolean,
     ): ProtectionChecklistState {
+        val accessibilityEnabled = ProtectionSystemChecker.isAccessibilityGuardEnabled(appContext)
+        val sgSettings = cachedScreenGuardSettings
         return ProtectionChecklistState(
             protectionMode = mode,
             modeConfigured = modeConfigured,
@@ -244,7 +284,10 @@ class ShieldRepository(
             pinConfigured = pinConfigured,
             waitDurationConfigured = waitConfigured,
             deviceAdminEnabled = ProtectionSystemChecker.isDeviceAdminActive(appContext),
-            accessibilityEnabled = ProtectionSystemChecker.isAccessibilityGuardEnabled(appContext),
+            accessibilityEnabled = accessibilityEnabled,
+            screenGuardEnabled = sgSettings.masterEnabled,
+            screenGuardRecentlyActive =
+                accessibilityEnabled && sgSettings.masterEnabled && isScreenGuardRecentlyActive(),
             vpnRunning = _isVpnRunning.value,
             vpnAlwaysOn = _isVpnAlwaysOn.value,
             privateDnsConfigured = ProtectionSystemChecker.isPrivateDnsConfigured(appContext),
@@ -397,6 +440,140 @@ class ShieldRepository(
         preferences.setWhenUnsure(policy)
     }
 
+    private suspend fun isTamperLocked(): Boolean = tamperEngine.getState().isGuardActive
+
+    suspend fun setScreenGuardMasterEnabled(enabled: Boolean): WaitTimeUpdateResult {
+        val current = cachedScreenGuardSettings
+        if (!enabled && current.masterEnabled && isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. Screen Guard cannot be turned off unless unlocked."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(masterEnabled = enabled) }
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun setScreenGuardUrlCheckEnabled(enabled: Boolean): WaitTimeUpdateResult {
+        val current = cachedScreenGuardSettings
+        if (!enabled && current.urlCheckEnabled && isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. URL check can only be turned off inside an unlock window."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(urlCheckEnabled = enabled) }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun setScreenGuardTextScoringEnabled(enabled: Boolean): WaitTimeUpdateResult {
+        val current = cachedScreenGuardSettings
+        if (!enabled && current.textScoringEnabled && isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. Text scoring can only be turned off inside an unlock window."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(textScoringEnabled = enabled) }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun setScreenGuardSearchGuardEnabled(enabled: Boolean): WaitTimeUpdateResult {
+        val current = cachedScreenGuardSettings
+        if (!enabled && current.searchGuardEnabled && isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. Search guard can only be turned off inside an unlock window."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(searchGuardEnabled = enabled) }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun setScreenGuardVisualCheckEnabled(enabled: Boolean): WaitTimeUpdateResult {
+        val current = cachedScreenGuardSettings
+        if (!enabled && current.visualCheckEnabled && isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. Visual check can only be turned off inside an unlock window."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(visualCheckEnabled = enabled) }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun setScreenGuardSensitivity(
+        sensitivity: ScreenGuardSensitivity
+    ): WaitTimeUpdateResult {
+        val current = cachedScreenGuardSettings
+        if (sensitivity.level < current.sensitivity.level && isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. Sensitivity can be raised anytime, but lowered only inside an unlock window."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(sensitivity = sensitivity) }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun setScreenGuardMonitorAllApps(enabled: Boolean): WaitTimeUpdateResult {
+        val current = cachedScreenGuardSettings
+        if (!enabled && current.monitorAllApps && isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. \"Monitor all apps\" cannot be turned off unless unlocked."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(monitorAllApps = enabled) }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun addScreenGuardAllowedApp(rawPackage: String): WaitTimeUpdateResult {
+        val cleaned = rawPackage.trim().lowercase(Locale.ROOT)
+        if (cleaned.isEmpty() || !cleaned.contains('.') || cleaned.any { it.isWhitespace() }) {
+            return WaitTimeUpdateResult.Rejected("Enter a valid package name (e.g. com.example.app).")
+        }
+        if (isTamperLocked()) {
+            return WaitTimeUpdateResult.Rejected(
+                "Tamper Protection is ON. Allowed apps can only be added inside an unlock window."
+            )
+        }
+        preferences.updateScreenGuardSettings { it.copy(allowedApps = it.allowedApps + cleaned) }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun removeScreenGuardAllowedApp(packageName: String): WaitTimeUpdateResult {
+        preferences.updateScreenGuardSettings {
+            it.copy(allowedApps = it.allowedApps - packageName)
+        }
+        return WaitTimeUpdateResult.Success
+    }
+
+    suspend fun classifyVisualThumbnail(
+        base64Jpeg: String
+    ): GeminiDomainClassifier.VisualClassificationResult {
+        return classifier.classifyImageBase64(base64Jpeg)
+    }
+
+    suspend fun recordScreenGuardBlock(
+        reason: ScreenGuardBlockReason,
+        hostOrPackage: String,
+        packageName: String,
+        durationMs: Long,
+    ) {
+        val safeSubject =
+            if (reason == ScreenGuardBlockReason.URL) {
+                DomainFilterEngine.normalizeDomain(hostOrPackage) ?: packageName
+            } else {
+                packageName
+            }
+        val entry =
+            BlockedLogEntity(
+                domain = safeSubject,
+                queryType = if (reason == ScreenGuardBlockReason.URL) "URL" else "APP",
+                reason = reason.label,
+                durationMs = durationMs.coerceAtLeast(1L),
+                timestamp = System.currentTimeMillis(),
+                packageName = packageName,
+            )
+        preferences.incrementBlockedCountersBy(1L)
+        database.insertAndTrimLog(entry)
+    }
+
     fun clearVerdictCache() {
         verdictCache.clear()
     }
@@ -510,5 +687,6 @@ class ShieldRepository(
     companion object {
         private const val LOG_BATCH_LIMIT = 20
         private const val LOG_FLUSH_INTERVAL_MS = 5000L
+        private const val SCREEN_GUARD_RECENT_WINDOW_MS = 5 * 60_000L
     }
 }

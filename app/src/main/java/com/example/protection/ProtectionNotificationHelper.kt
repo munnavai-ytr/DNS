@@ -23,7 +23,9 @@ object ProtectionNotificationHelper {
 
     private const val NOTIFICATION_ID_TIMER = 1002
     private const val NOTIFICATION_ID_WEAKENED = 1003
-    private const val MIN_TIMER_NOTIFY_INTERVAL_MS = 5000L
+    private const val NOTIFICATION_ID_COUNTDOWN_READY = 1004
+    private const val NOTIFICATION_ID_RELOCKED = 1005
+    private const val MIN_TIMER_NOTIFY_INTERVAL_MS = 30_000L
 
     @Volatile private var lastTimerNotifyElapsedMs = 0L
     @Volatile private var lastTimerKey = ""
@@ -49,6 +51,8 @@ object ProtectionNotificationHelper {
             )
                 .apply {
                     description = context.getString(R.string.notification_alert_channel_desc)
+                    enableVibration(true)
+                    enableLights(true)
                 }
 
         manager.createNotificationChannel(statusChannel)
@@ -62,6 +66,7 @@ object ProtectionNotificationHelper {
         if (state.isStrictLock) {
             lastTimerKey = ""
             manager.cancel(NOTIFICATION_ID_TIMER)
+            manager.cancel(NOTIFICATION_ID_COUNTDOWN_READY)
             return
         }
 
@@ -78,7 +83,11 @@ object ProtectionNotificationHelper {
                 lastTimerKey = ""
                 manager.cancel(NOTIFICATION_ID_TIMER)
             }
+            manager.cancel(NOTIFICATION_ID_COUNTDOWN_READY)
             return
+        }
+        if (modeKey != "READY") {
+            manager.cancel(NOTIFICATION_ID_COUNTDOWN_READY)
         }
 
         val now = SystemClock.elapsedRealtime()
@@ -211,6 +220,48 @@ object ProtectionNotificationHelper {
                 .setContentIntent(tapIntent)
                 .build()
         manager.notify(NOTIFICATION_ID_WEAKENED, notification)
+    }
+
+    fun postCountdownReadyAlert(context: Context) {
+        ensureChannels(context)
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        val tapIntent = buildMainActivityIntent(context, DEST_UNLOCK, requestCode = 206)
+        val title = context.getString(R.string.notification_countdown_ready_title)
+        val desc = context.getString(R.string.notification_countdown_ready_desc)
+        val notification =
+            NotificationCompat.Builder(context, CHANNEL_PROTECTION_ALERT)
+                .setSmallIcon(R.drawable.ic_shield_notification)
+                .setContentTitle(title)
+                .setContentText(desc)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(desc))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+                .setAutoCancel(true)
+                .setContentIntent(tapIntent)
+                .build()
+        manager.notify(NOTIFICATION_ID_COUNTDOWN_READY, notification)
+    }
+
+    fun postProtectionLockedAgainAlert(context: Context) {
+        ensureChannels(context)
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        val tapIntent = buildMainActivityIntent(context, DEST_CHECKLIST, requestCode = 207)
+        val title = context.getString(R.string.notification_relocked_title)
+        val desc = context.getString(R.string.notification_relocked_desc)
+        val notification =
+            NotificationCompat.Builder(context, CHANNEL_PROTECTION_ALERT)
+                .setSmallIcon(R.drawable.ic_shield_notification)
+                .setContentTitle(title)
+                .setContentText(desc)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(desc))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
+                .setAutoCancel(true)
+                .setContentIntent(tapIntent)
+                .build()
+        manager.notify(NOTIFICATION_ID_RELOCKED, notification)
     }
 
     private fun buildMainActivityIntent(

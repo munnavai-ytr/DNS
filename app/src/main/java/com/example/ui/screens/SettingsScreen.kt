@@ -75,6 +75,7 @@ import com.example.R
 import com.example.data.local.CustomRuleEntity
 import com.example.dns.DomainVerdict
 import com.example.dns.UnsurePolicy
+import com.example.protection.ScreenGuardSensitivity
 import com.example.protection.WaitDurationOption
 import com.example.protection.WaitTimeUpdateResult
 import com.example.ui.theme.ShieldAmber
@@ -105,6 +106,16 @@ fun SettingsScreen(
     onOpenChangePin: () -> Unit,
     onSelectWaitDuration: suspend (WaitDurationOption) -> WaitTimeUpdateResult,
     onShowFeedback: (String) -> Unit,
+    onToggleScreenGuardMaster: (Boolean) -> Unit,
+    onToggleScreenGuardUrlCheck: (Boolean) -> Unit,
+    onToggleScreenGuardTextScoring: (Boolean) -> Unit,
+    onToggleScreenGuardSearchGuard: (Boolean) -> Unit,
+    onToggleScreenGuardVisualCheck: (Boolean) -> Unit,
+    onSelectScreenGuardSensitivity: (ScreenGuardSensitivity) -> Unit,
+    onToggleScreenGuardMonitorAllApps: (Boolean) -> Unit,
+    onAddScreenGuardAllowedApp: (String) -> Unit,
+    onRemoveScreenGuardAllowedApp: (String) -> Unit,
+    onOpenScreenGuardTest: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -133,6 +144,21 @@ fun SettingsScreen(
                 onOpenChangePin = onOpenChangePin,
                 onSelectWaitDuration = onSelectWaitDuration,
                 onShowFeedback = onShowFeedback,
+            )
+
+            // V4 Screen Guard Card
+            ScreenGuardSettingsCard(
+                uiState = uiState,
+                onToggleMaster = onToggleScreenGuardMaster,
+                onToggleUrlCheck = onToggleScreenGuardUrlCheck,
+                onToggleTextScoring = onToggleScreenGuardTextScoring,
+                onToggleSearchGuard = onToggleScreenGuardSearchGuard,
+                onToggleVisualCheck = onToggleScreenGuardVisualCheck,
+                onSelectSensitivity = onSelectScreenGuardSensitivity,
+                onToggleMonitorAllApps = onToggleScreenGuardMonitorAllApps,
+                onAddAllowedApp = onAddScreenGuardAllowedApp,
+                onRemoveAllowedApp = onRemoveScreenGuardAllowedApp,
+                onOpenTestScreen = onOpenScreenGuardTest,
             )
 
             // AI Verification Card
@@ -984,6 +1010,341 @@ private fun TamperProtectionSettingsCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ScreenGuardSettingsCard(
+    uiState: MainUiState,
+    onToggleMaster: (Boolean) -> Unit,
+    onToggleUrlCheck: (Boolean) -> Unit,
+    onToggleTextScoring: (Boolean) -> Unit,
+    onToggleSearchGuard: (Boolean) -> Unit,
+    onToggleVisualCheck: (Boolean) -> Unit,
+    onSelectSensitivity: (ScreenGuardSensitivity) -> Unit,
+    onToggleMonitorAllApps: (Boolean) -> Unit,
+    onAddAllowedApp: (String) -> Unit,
+    onRemoveAllowedApp: (String) -> Unit,
+    onOpenTestScreen: () -> Unit,
+) {
+    val sg = uiState.screenGuardSettings
+    val isLocked = uiState.tamperState.isGuardActive
+    var allowedAppDraft by remember { mutableStateOf("") }
+
+    val submitAllowedApp = {
+        if (allowedAppDraft.isNotBlank() && !isLocked) {
+            onAddAllowedApp(allowedAppDraft)
+            allowedAppDraft = ""
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth().testTag("settings_screen_guard_card"),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Policy,
+                        contentDescription = null,
+                        tint = ShieldEmerald,
+                    )
+                    Column {
+                        Text(
+                            text = stringResource(R.string.screen_guard_title),
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "Detects in-app adult URLs, text & search queries",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Switch(
+                    checked = sg.masterEnabled,
+                    onCheckedChange = onToggleMaster,
+                    enabled = !isLocked || !sg.masterEnabled,
+                    modifier = Modifier.testTag("screen_guard_master_switch"),
+                )
+            }
+
+            // Privacy statement
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = ShieldEmerald.copy(alpha = 0.12f),
+                border = BorderStroke(1.dp, ShieldEmerald.copy(alpha = 0.35f)),
+            ) {
+                Text(
+                    text = stringResource(R.string.screen_guard_privacy_statement),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+
+            if (isLocked) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = ShieldAmber.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, ShieldAmber.copy(alpha = 0.4f)),
+                ) {
+                    Text(
+                        text =
+                            if (uiState.tamperState.isStrictLock) {
+                                "Strict Lock is ON: you can raise sensitivity or turn checks ON anytime, but protections cannot be lowered, turned off, or weakened."
+                            } else {
+                                "Tamper Protection is ON: you can raise sensitivity or turn checks ON anytime. Lowering sensitivity, turning checks OFF, or adding allowed apps requires an active unlock window."
+                            },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = ShieldAmber,
+                        modifier = Modifier.padding(12.dp),
+                    )
+                }
+            }
+
+            if (!uiState.checklistState.accessibilityEnabled) {
+                Text(
+                    text = "Accessibility Service (DNS Shield Guard) is OFF. Enable it in Setup & Checklist so Screen Guard can scan in-app content.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = ShieldCoral,
+                )
+            }
+
+            ScreenGuardToggleRow(
+                title = "Browser URL check",
+                subtitle = "Checks browser address bar hosts against DNS filter & AI",
+                checked = sg.urlCheckEnabled,
+                enabled = !isLocked || !sg.urlCheckEnabled,
+                testTag = "screen_guard_url_switch",
+                onCheckedChange = onToggleUrlCheck,
+            )
+
+            ScreenGuardToggleRow(
+                title = "On-screen text scoring",
+                subtitle = "Scores visible text locally on device (English & Bengali)",
+                checked = sg.textScoringEnabled,
+                enabled = !isLocked || !sg.textScoringEnabled,
+                testTag = "screen_guard_text_switch",
+                onCheckedChange = onToggleTextScoring,
+            )
+
+            ScreenGuardToggleRow(
+                title = "Search box guard",
+                subtitle = "Clears adult search queries immediately and blocks",
+                checked = sg.searchGuardEnabled,
+                enabled = !isLocked || !sg.searchGuardEnabled,
+                testTag = "screen_guard_search_switch",
+                onCheckedChange = onToggleSearchGuard,
+            )
+
+            ScreenGuardToggleRow(
+                title = "Monitor all apps",
+                subtitle = "When OFF, scans browsers and major social/video apps only",
+                checked = sg.monitorAllApps,
+                enabled = !isLocked || !sg.monitorAllApps,
+                testTag = "screen_guard_monitor_all_switch",
+                onCheckedChange = onToggleMonitorAllApps,
+            )
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+            // Sensitivity chips
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = "Text sensitivity",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    ScreenGuardSensitivity.entries.forEach { option ->
+                        val selected = sg.sensitivity == option
+                        val canSelect = !isLocked || option.level >= sg.sensitivity.level
+                        FilterChip(
+                            selected = selected,
+                            enabled = canSelect,
+                            onClick = { onSelectSensitivity(option) },
+                            label = { Text(option.label) },
+                            modifier =
+                                Modifier.weight(1f).testTag("screen_guard_sens_${option.name}"),
+                            colors =
+                                FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = ShieldEmerald.copy(alpha = 0.2f),
+                                    selectedLabelColor = ShieldEmerald,
+                                ),
+                        )
+                    }
+                }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+            // Optional Visual Check (default OFF) + explicit warning
+            ScreenGuardToggleRow(
+                title = "Visual check (Optional, OFF by default)",
+                subtitle = "API 30+: classifies downscaled thumbnails on monitored media apps",
+                checked = sg.visualCheckEnabled,
+                enabled = !isLocked || !sg.visualCheckEnabled,
+                testTag = "screen_guard_visual_switch",
+                onCheckedChange = onToggleVisualCheck,
+            )
+
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = ShieldAmber.copy(alpha = 0.12f),
+                border = BorderStroke(1.dp, ShieldAmber.copy(alpha = 0.4f)),
+            ) {
+                Text(
+                    text = stringResource(R.string.screen_guard_visual_warning),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = ShieldAmber,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+
+            if (sg.visualCheckEnabled && uiState.geminiApiKey.isBlank()) {
+                Text(
+                    text = "Set your Gemini API key below for visual check to run.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = ShieldCoral,
+                )
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+            // Allowed apps exclusion list
+            Text(
+                text = "Allowed apps (excluded from Screen Guard)",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = allowedAppDraft,
+                    onValueChange = { allowedAppDraft = it },
+                    enabled = !isLocked,
+                    modifier = Modifier.weight(1f).testTag("screen_guard_allowed_app_input"),
+                    placeholder = { Text("com.example.reader") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { submitAllowedApp() }),
+                    shape = RoundedCornerShape(12.dp),
+                )
+                Button(
+                    onClick = submitAllowedApp,
+                    enabled = !isLocked && allowedAppDraft.isNotBlank(),
+                    modifier = Modifier.height(52.dp).testTag("screen_guard_add_allowed_app_btn"),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Icon(imageVector = Icons.Filled.Add, contentDescription = "Allow app")
+                }
+            }
+
+            if (sg.allowedApps.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    sg.allowedApps.sorted().forEach { pkg ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = pkg,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            IconButton(
+                                onClick = { onRemoveAllowedApp(pkg) },
+                                modifier = Modifier.testTag("screen_guard_remove_app_$pkg"),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Remove $pkg",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            OutlinedButton(
+                onClick = onOpenTestScreen,
+                modifier =
+                    Modifier.fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("screen_guard_test_button"),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, ShieldCyan.copy(alpha = 0.65f)),
+            ) {
+                Text(
+                    text = stringResource(R.string.screen_guard_test_button),
+                    color = ShieldCyan,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScreenGuardToggleRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    enabled: Boolean,
+    testTag: String,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled,
+            modifier = Modifier.testTag(testTag),
+        )
     }
 }
 

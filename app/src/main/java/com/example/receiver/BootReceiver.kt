@@ -35,6 +35,7 @@ class BootReceiver : BroadcastReceiver() {
                 ProtectionWatchdogScheduler.ensurePeriodicWatchdog(context)
                 val snapshot =
                     app.repository.refreshProtectionState(restartVpnIfProtectedAndDown = false)
+                ProtectionWatchdogScheduler.syncBoundaryTimer(context, snapshot.tamperState)
                 val isVpnMode = snapshot.tamperState.protectionMode == ProtectionMode.VPN
                 val shouldStart =
                     isVpnMode &&

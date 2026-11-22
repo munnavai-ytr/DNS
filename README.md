@@ -13,6 +13,12 @@ A local, privacy-first Android DNS filter built with Kotlin, Jetpack Compose (Ma
   - **Strict Lock**: Requires two confirmations including typing `I UNDERSTAND`. Has no PIN and no unlock path at all — only a factory reset removes the app.
   - **Accessibility Guard Overlay**: Uses an opaque `TYPE_ACCESSIBILITY_OVERLAY` window (`DNS Shield Guard`) to cover DNS Shield's App Info, Device Admin, Accessibility, VPN, Uninstaller, and Private DNS settings screens whenever protection is ON.
   - **Watchdog**: 15-minute `JobScheduler` / `AlarmManager` check posts `"Protection weakened, tap to fix"` if VPN/Private DNS, Device Admin, or Accessibility Guard is disabled.
+- **In-App Screen Guard (V4)**:
+  - **Layer A (Browser URL Check)**: Reads supported browser address bars and runs the host through the DNS filter & 3-second AI verifier.
+  - **Layer B (On-Screen Text Scoring)**: Scores visible text strictly on-device (`assets/adult_keywords.txt` & `assets/safe_context.txt`, English + Bengali script + Banglish + obfuscation normalization) with `Low` / `Medium` / `High` sensitivity, skipping password fields and banking/wallet/authenticator apps.
+  - **Layer C (Search Box Guard)**: Clears blocked adult search queries in editable search fields and navigates back immediately.
+  - **Layer D (Optional Visual Check — OFF by default)**: On API 30+, optionally classifies downscaled (`<= 256px`) thumbnails on monitored browsers/social/video apps via Gemini with `>= 0.8` confidence threshold. Screen text, matched terms, paths, and images are never saved.
+  - **Escalation & Self-Test**: Blocks show an overlay and navigate Back/Home with a 5-second per-app cooldown; 3 blocks in the same app within 10 minutes trigger a 5-minute cool-down overlay. Use **Settings → Screen Guard → Test Screen Guard** to verify detection safely.
 
 ## Important Setup Notes
 - **Always-On VPN (VPN Mode)**: Turn ON **Always-on VPN** in Android VPN settings, but **do NOT** enable **"Block connections without VPN"** — only DNS traffic routes through DNS Shield, so enabling that toggle would block all internet access.

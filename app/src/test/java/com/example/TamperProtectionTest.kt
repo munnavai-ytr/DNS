@@ -8,7 +8,9 @@ import com.example.protection.ProtectionChecklistState
 import com.example.protection.ProtectionClock
 import com.example.protection.ProtectionLevel
 import com.example.protection.ProtectionMode
+import com.example.protection.ProtectionWatchdogScheduler
 import com.example.protection.TamperProtectionEngine
+import com.example.protection.TimerTransitions
 import com.example.protection.WaitDurationOption
 import com.example.protection.WaitTimeUpdateResult
 import kotlinx.coroutines.runBlocking
@@ -355,5 +357,103 @@ class TamperProtectionTest {
                 privateDnsEngine.getState(),
             ),
         )
+    }
+
+    @Test
+    fun countdownCompletesWithoutUi_andBoundaryTimerUsesExactRemainingTimeWithoutCap() =
+        runBlocking {
+            val clock = FakeProtectionClock()
+            val store = InMemoryProtectionStateStore()
+            val engine = TamperProtectionEngine(store, clock)
+            setupActivatedProtection(
+                engine,
+                pin = "654321",
+                waitDuration = WaitDurationOption.TWENTY_FOUR_HOURS,
+            )
+
+            // No timer active -> boundary delay is null
+            assertEquals(null, ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(engine.getState()))
+            assertFalse(ProtectionWatchdogScheduler.hasActiveTimer(engine.getState()))
+
+            // Start 24-hour countdown
+            assertEquals(PinActionResult.Success, engine.requestTurnOffProtection("654321"))
+            val startedState = engine.getState()
+            assertTrue(ProtectionWatchdogScheduler.hasActiveTimer(startedState))
+            assertEquals(
+                24L * 60L * 60_000L,
+                ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(startedState),
+            )
+
+            // Simulate app process dying while closed and resuming headless with no UI after 12 hours
+            clock.advanceBy(12L * 60L * 60_000L)
+            val headlessResumedEngine = TamperProtectionEngine(store, clock)
+            val midState = headlessResumedEngine.getState()
+            assertTrue(midState.isCountdownActive)
+            assertEquals(
+                12L * 60L * 60_000L,
+                ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(midState),
+            )
+            assertEquals(TimerTransitions(), headlessResumedEngine.consumePendingTransitions())
+
+            // Advance final 12 hours with no UI alive -> countdown completes immediately
+            clock.advanceBy(12L * 60L * 60_000L)
+            val readyState = headlessResumedEngine.getState()
+            assertFalse(readyState.isCountdownActive)
+            assertTrue(readyState.isCountdownReadyToUnlock)
+            assertEquals(
+                TimerTransitions(countdownCompleted = true, unlockWindowEnded = false),
+                headlessResumedEngine.consumePendingTransitions(),
+            )
+            // Transition is consumed once only
+            assertEquals(TimerTransitions(), headlessResumedEngine.consumePendingTransitions())
+            assertEquals(null, ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(readyState))
+            assertFalse(ProtectionWatchdogScheduler.hasActiveTimer(readyState))
+
+            // Enter second PIN to start 15-minute unlock window -> exact 15m boundary
+            assertEquals(PinActionResult.Success, headlessResumedEngine.confirmUnlockWindow("654321"))
+            val unlockedState = headlessResumedEngine.getState()
+            assertEquals(
+                15L * 60_000L,
+                ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(unlockedState),
+            )
+
+            // Advance 15 minutes with no UI -> unlock window expires and emits transition once
+            clock.advanceBy(15L * 60_000L)
+            val relockedState = headlessResumedEngine.getState()
+            assertFalse(relockedState.isUnlockWindowActive)
+            assertTrue(relockedState.isGuardActive)
+            assertEquals(
+                TimerTransitions(countdownCompleted = false, unlockWindowEnded = true),
+                headlessResumedEngine.consumePendingTransitions(),
+            )
+            assertEquals(null, ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(relockedState))
+        }
+
+    @Test
+    fun boundaryTimer_picksNearestActiveTimerIncludingLockoutWithoutCap() = runBlocking {
+        val clock = FakeProtectionClock()
+        val engine = TamperProtectionEngine(InMemoryProtectionStateStore(), clock)
+        setupActivatedProtection(
+            engine,
+            pin = "121212",
+            waitDuration = WaitDurationOption.TEN_MINUTES,
+        )
+
+        // Start 10-minute countdown, then fail PIN 5 times on confirmUnlockWindow (wait: trigger
+        // lockout first, then see lockout boundary = 30m exact; or test both)
+        repeat(5) { engine.requestTurnOffProtection("000000") }
+        val lockedState = engine.getState()
+        assertTrue(lockedState.isLockedOut)
+        assertTrue(ProtectionWatchdogScheduler.hasActiveTimer(lockedState))
+        assertEquals(
+            30L * 60_000L,
+            ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(lockedState),
+        )
+
+        // Advance 30m -> lockout clears and boundary becomes null
+        clock.advanceBy(30L * 60_000L)
+        val clearedState = engine.getState()
+        assertFalse(clearedState.isLockedOut)
+        assertEquals(null, ProtectionWatchdogScheduler.computeNearestTimerRemainingMs(clearedState))
     }
 }

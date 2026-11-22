@@ -965,6 +965,18 @@ private fun ProtectionChecklistCard(
                 "4. Accessibility Guard (DNS Shield Guard) enabled (Required)",
                 checklist.accessibilityEnabled,
             )
+            StatusTickRow(
+                label =
+                    when {
+                        !checklist.screenGuardEnabled -> "Screen Guard: Disabled in Settings"
+                        !checklist.accessibilityEnabled ->
+                            "Screen Guard: Accessibility service not running"
+                        checklist.screenGuardRecentlyActive ->
+                            "Screen Guard: Running and recently active"
+                        else -> "Screen Guard: Enabled (waiting for app activity)"
+                    },
+                isGreen = checklist.screenGuardRecentlyActive,
+            )
 
             if (checklist.protectionMode == ProtectionMode.VPN) {
                 StatusTickRow("5. Local DNS VPN running", checklist.vpnRunning)

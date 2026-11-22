@@ -39,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
@@ -58,9 +59,11 @@ import java.util.Locale
 fun LogsScreen(
     logs: List<BlockedLogEntity>,
     onWhitelistDomain: (String) -> Unit,
+    onAllowApp: (String) -> Unit,
     onClearLogs: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     var searchQuery by remember { mutableStateOf("") }
     var showClearDialog by remember { mutableStateOf(false) }
 
@@ -70,7 +73,9 @@ fun LogsScreen(
             if (q.isEmpty()) logs
             else {
                 logs.filter {
-                    it.domain.contains(q) || it.reason.lowercase(Locale.ROOT).contains(q)
+                    it.domain.contains(q, ignoreCase = true) ||
+                        it.reason.contains(q, ignoreCase = true) ||
+                        it.packageName.contains(q, ignoreCase = true)
                 }
             }
         }
@@ -185,10 +190,31 @@ fun LogsScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(filteredLogs, key = { it.id }) { item ->
+                        val appLabel =
+                            remember(item.packageName) {
+                                if (item.packageName.isBlank()) null
+                                else {
+                                    runCatching {
+                                            val pm = context.packageManager
+                                            val ai = pm.getApplicationInfo(item.packageName, 0)
+                                            pm.getApplicationLabel(ai).toString()
+                                        }
+                                        .getOrNull()
+                                }
+                            }
+                        val isOwnAppEntry = item.packageName == context.packageName && item.queryType == "APP"
                         BlockedLogRow(
                             entry = item,
+                            appLabel = appLabel,
+                            showAllowAction = !isOwnAppEntry,
                             formattedTime = timeFormatter.format(Date(item.timestamp)),
-                            onWhitelist = { onWhitelistDomain(item.domain) },
+                            onAllowAction = {
+                                if (item.queryType == "APP" && item.packageName.isNotBlank()) {
+                                    onAllowApp(item.packageName)
+                                } else {
+                                    onWhitelistDomain(item.domain)
+                                }
+                            },
                         )
                     }
                 }
@@ -222,13 +248,15 @@ fun LogsScreen(
 @Composable
 private fun BlockedLogRow(
     entry: BlockedLogEntity,
+    appLabel: String?,
+    showAllowAction: Boolean,
     formattedTime: String,
-    onWhitelist: () -> Unit,
+    onAllowAction: () -> Unit,
 ) {
     val reasonTint =
         when (entry.reason) {
-            "AI" -> ShieldCyan
-            "Keyword", "Upstream filter" -> ShieldAmber
+            "AI", "Visual" -> ShieldCyan
+            "Keyword", "Upstream filter", "Search" -> ShieldAmber
             else -> ShieldCoral
         }
 
@@ -248,7 +276,12 @@ private fun BlockedLogRow(
                 verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
                 Text(
-                    text = entry.domain,
+                    text =
+                        if (entry.queryType == "APP" && !appLabel.isNullOrBlank()) {
+                            "$appLabel (${entry.domain})"
+                        } else {
+                            entry.domain
+                        },
                     style = MaterialTheme.typography.bodyLarge,
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurface,
@@ -285,6 +318,18 @@ private fun BlockedLogRow(
                         )
                     }
                 }
+                if (entry.packageName.isNotBlank() && entry.queryType == "URL") {
+                    val pkgDisplay =
+                        if (!appLabel.isNullOrBlank()) "$appLabel (${entry.packageName})"
+                        else entry.packageName
+                    Text(
+                        text = pkgDisplay,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 Text(
                     text = formattedTime,
                     style = MaterialTheme.typography.bodyMedium,
@@ -292,15 +337,19 @@ private fun BlockedLogRow(
                 )
             }
 
-            IconButton(
-                onClick = onWhitelist,
-                modifier = Modifier.testTag("whitelist_log_button_${entry.id}"),
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.CheckCircleOutline,
-                    contentDescription = "Allow ${entry.domain} in whitelist",
-                    tint = ShieldEmerald,
-                )
+            if (showAllowAction) {
+                IconButton(
+                    onClick = onAllowAction,
+                    modifier = Modifier.testTag("whitelist_log_button_${entry.id}"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.CheckCircleOutline,
+                        contentDescription =
+                            if (entry.queryType == "APP") "Allow app ${entry.packageName}"
+                            else "Allow ${entry.domain} in whitelist",
+                        tint = ShieldEmerald,
+                    )
+                }
             }
         }
     }

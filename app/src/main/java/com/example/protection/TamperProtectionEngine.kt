@@ -3,11 +3,30 @@ package com.example.protection
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
+data class TimerTransitions(
+    val countdownCompleted: Boolean = false,
+    val unlockWindowEnded: Boolean = false,
+)
+
 class TamperProtectionEngine(
     private val store: ProtectionStateStore,
     private val clock: ProtectionClock = SystemProtectionClock,
 ) {
     private val mutex = Mutex()
+    private var pendingCountdownCompleted = false
+    private var pendingUnlockWindowEnded = false
+
+    suspend fun consumePendingTransitions(): TimerTransitions =
+        mutex.withLock {
+            val transitions =
+                TimerTransitions(
+                    countdownCompleted = pendingCountdownCompleted,
+                    unlockWindowEnded = pendingUnlockWindowEnded,
+                )
+            pendingCountdownCompleted = false
+            pendingUnlockWindowEnded = false
+            transitions
+        }
 
     suspend fun getState(): TamperProtectionState =
         mutex.withLock {
@@ -112,6 +131,8 @@ class TamperProtectionEngine(
                     lockoutRemainingMs = 0L,
                 )
             store.writeState(updated)
+            pendingCountdownCompleted = false
+            pendingUnlockWindowEnded = false
             PinActionResult.Success
         }
 
@@ -235,6 +256,8 @@ class TamperProtectionEngine(
                     unlockWindowRemainingMs = 0L,
                 )
             store.writeState(updated)
+            pendingCountdownCompleted = false
+            pendingUnlockWindowEnded = false
             PinActionResult.Success
         }
 
@@ -274,6 +297,8 @@ class TamperProtectionEngine(
                     unlockWindowRemainingMs = UNLOCK_WINDOW_DURATION_MS,
                 )
             store.writeState(updated)
+            pendingCountdownCompleted = false
+            pendingUnlockWindowEnded = false
             PinActionResult.Success
         }
 
@@ -287,6 +312,7 @@ class TamperProtectionEngine(
                     countdownReadyForSecondPin = false,
                 )
             store.writeState(updated)
+            pendingCountdownCompleted = false
             toPublicState(updated)
         }
 
@@ -299,6 +325,7 @@ class TamperProtectionEngine(
                     unlockWindowRemainingMs = 0L,
                 )
             store.writeState(updated)
+            pendingUnlockWindowEnded = false
             toPublicState(updated)
         }
 
@@ -321,6 +348,8 @@ class TamperProtectionEngine(
                     unlockWindowRemainingMs = 0L,
                 )
             store.writeState(updated)
+            pendingCountdownCompleted = false
+            pendingUnlockWindowEnded = false
             true
         }
 
@@ -421,6 +450,13 @@ class TamperProtectionEngine(
             nextCountdownReady = false
             nextUnlockActive = false
             nextUnlockRem = 0L
+        } else {
+            if (raw.countdownActive && !nextCountdownActive && nextCountdownReady) {
+                pendingCountdownCompleted = true
+            }
+            if (raw.unlockWindowActive && !nextUnlockActive) {
+                pendingUnlockWindowEnded = true
+            }
         }
 
         val synced =

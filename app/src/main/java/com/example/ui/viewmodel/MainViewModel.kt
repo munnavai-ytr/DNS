@@ -21,6 +21,8 @@ import com.example.protection.ProtectionChecklistState
 import com.example.protection.ProtectionLevel
 import com.example.protection.ProtectionMode
 import com.example.protection.ProtectionNotificationHelper
+import com.example.protection.ScreenGuardSensitivity
+import com.example.protection.ScreenGuardSettings
 import com.example.protection.TamperProtectionState
 import com.example.protection.WaitDurationOption
 import com.example.protection.WaitTimeUpdateResult
@@ -94,6 +96,7 @@ data class MainUiState(
     val tamperState: TamperProtectionState = TamperProtectionState(),
     val checklistState: ProtectionChecklistState = ProtectionChecklistState(),
     val protectionLevel: ProtectionLevel = ProtectionLevel.OFF,
+    val screenGuardSettings: ScreenGuardSettings = ScreenGuardSettings(),
     val ruleFeedbackMessage: String? = null,
 )
 
@@ -203,6 +206,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     tamperState = extra.protection.tamperState,
                     checklistState = extra.protection.checklist,
                     protectionLevel = extra.protection.protectionLevel,
+                    screenGuardSettings = base.stats.screenGuardSettings,
                     ruleFeedbackMessage = secondary.feedback,
                 )
             }
@@ -467,6 +471,90 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repository.addCustomRule(domain, isWhitelist = true)
             ruleFeedback.value = "Whitelisted $domain"
         }
+    }
+
+    fun setScreenGuardMasterEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            when (val res = repository.setScreenGuardMasterEnabled(enabled)) {
+                WaitTimeUpdateResult.Success -> Unit
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun setScreenGuardUrlCheckEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            when (val res = repository.setScreenGuardUrlCheckEnabled(enabled)) {
+                WaitTimeUpdateResult.Success -> Unit
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun setScreenGuardTextScoringEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            when (val res = repository.setScreenGuardTextScoringEnabled(enabled)) {
+                WaitTimeUpdateResult.Success -> Unit
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun setScreenGuardSearchGuardEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            when (val res = repository.setScreenGuardSearchGuardEnabled(enabled)) {
+                WaitTimeUpdateResult.Success -> Unit
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun setScreenGuardVisualCheckEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            when (val res = repository.setScreenGuardVisualCheckEnabled(enabled)) {
+                WaitTimeUpdateResult.Success -> Unit
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun setScreenGuardSensitivity(sensitivity: ScreenGuardSensitivity) {
+        viewModelScope.launch {
+            when (val res = repository.setScreenGuardSensitivity(sensitivity)) {
+                WaitTimeUpdateResult.Success ->
+                    ruleFeedback.value = "Screen Guard sensitivity: ${sensitivity.label}"
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun setScreenGuardMonitorAllApps(enabled: Boolean) {
+        viewModelScope.launch {
+            when (val res = repository.setScreenGuardMonitorAllApps(enabled)) {
+                WaitTimeUpdateResult.Success -> Unit
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun addScreenGuardAllowedApp(pkg: String) {
+        viewModelScope.launch {
+            when (val res = repository.addScreenGuardAllowedApp(pkg)) {
+                WaitTimeUpdateResult.Success -> ruleFeedback.value = "Added $pkg to allowed apps"
+                is WaitTimeUpdateResult.Rejected -> ruleFeedback.value = res.reason
+            }
+        }
+    }
+
+    fun removeScreenGuardAllowedApp(pkg: String) {
+        viewModelScope.launch {
+            repository.removeScreenGuardAllowedApp(pkg)
+            ruleFeedback.value = "Removed $pkg from allowed apps"
+        }
+    }
+
+    fun setScreenGuardTestScreenOpen(open: Boolean) {
+        repository.setScreenGuardTestScreenOpen(open)
     }
 
     fun clearLogs() {

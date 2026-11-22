@@ -54,6 +54,8 @@ data class ProtectionChecklistState(
     val waitDurationConfigured: Boolean = false,
     val deviceAdminEnabled: Boolean = false,
     val accessibilityEnabled: Boolean = false,
+    val screenGuardEnabled: Boolean = true,
+    val screenGuardRecentlyActive: Boolean = false,
     val vpnRunning: Boolean = false,
     val vpnAlwaysOn: Boolean = false,
     val privateDnsConfigured: Boolean = false,

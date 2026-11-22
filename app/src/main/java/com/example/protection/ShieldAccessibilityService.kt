@@ -15,6 +15,7 @@ import android.text.InputType
 import android.text.method.PasswordTransformationMethod
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -54,69 +55,190 @@ class ShieldAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private var screenGuardPipeline: ScreenGuardPipeline? = null
+
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
     private var overlayLockTypeShown: LockType? = null
+    private var overlayShownAtMs: Long = 0L
+    private var lastProcessedElapsedMs: Long = 0L
     private var statusTextView: TextView? = null
     private var pinInputView: EditText? = null
     private var submitPinButton: Button? = null
 
+    // V4 Screen Guard content-block / 5-minute cooldown overlay (non-focusable, separate from V3 overlay)
+    private var contentBlockOverlayView: View? = null
+    private var blockedOverlayPackage: String? = null
+    private var isCooldownOverlayShowing: Boolean = false
+    private var cooldownOverlayPackage: String? = null
+    private var cooldownMessageTextView: TextView? = null
+    private var pendingDismissBlockRunnable: Runnable? = null
+    private var pendingBackRecheckRunnable: Runnable? = null
+    private var pendingCooldownTickRunnable: Runnable? = null
+
+    private var timerTicker: ProtectionTimerTicker? = null
+
     @Volatile private var cachedLauncherPackage: String? = null
     @Volatile private var lastBounceElapsedMs = 0L
     @Volatile private var lastToastElapsedMs = 0L
+    @Volatile private var lastTimerEventRefreshElapsedMs = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WindowManager::class.java)
         cachedLauncherPackage = ProtectionSystemChecker.getDefaultLauncherPackage(applicationContext)
+        val app = applicationContext as? DnsShieldApplication
+        if (app != null) {
+            app.repository.markScreenGuardHeartbeat()
+            ensureScreenGuardPipeline(app.repository)
+            timerTicker?.stop()
+            timerTicker =
+                ProtectionTimerTicker(scope = serviceScope, repository = app.repository).also {
+                    it.startObserving()
+                }
+        }
         ProtectionWatchdogReceiver.triggerAudit(applicationContext)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val app = applicationContext as? DnsShieldApplication ?: return
         val repository = app.repository
+        repository.markScreenGuardHeartbeat()
+        val pipeline = ensureScreenGuardPipeline(repository)
 
-        // Never guard when protection is OFF or when a Trusted PIN unlock window is active
-        if (!repository.isGuardBlockingNowSync()) {
-            removeOverlay()
-            return
+        val tamperState = repository.protectionUiSnapshot.value.tamperState
+        if (ProtectionWatchdogScheduler.hasActiveTimer(tamperState)) {
+            val nowElapsed = SystemClock.elapsedRealtime()
+            if (nowElapsed - lastTimerEventRefreshElapsedMs >= TIMER_EVENT_REFRESH_INTERVAL_MS) {
+                lastTimerEventRefreshElapsedMs = nowElapsed
+                val wasUnlockActive = tamperState.isUnlockWindowActive
+                serviceScope.launch {
+                    repository.refreshProtectionState(
+                        restartVpnIfProtectedAndDown = wasUnlockActive
+                    )
+                }
+            }
         }
 
+        val eventType = event?.eventType
         val eventPkg = event?.packageName?.toString().orEmpty()
-        // If user is interacting with our own overlay view (e.g., typing PIN), keep overlay intact
-        if (overlayView != null && eventPkg == packageName) {
+
+        // --- V3 Tamper Guard (settings / uninstaller lock) ---
+        val isV3Blocking = repository.isGuardBlockingNowSync()
+        if (!isV3Blocking) {
+            removeOverlay()
+        } else {
+            // If V3 overlay is showing and the event comes from our own package or a soft keyboard,
+            // return immediately without removing the overlay or walking the node tree.
+            if (overlayView != null && (eventPkg == packageName || isSoftKeyboardPackage(eventPkg))) {
+                return
+            }
+
+            if (
+                eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                    eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            ) {
+                handleV3TamperGuard(eventType = eventType, eventPkg = eventPkg, repository = repository)
+            }
+        }
+
+        // If V3 Tamper Guard overlay is active, do not run V4 content scanning underneath it
+        if (overlayView != null) {
             return
         }
 
+        // Dismiss V4 overlay immediately when the user switches to a different app
+        if (
+            contentBlockOverlayView != null &&
+                eventPkg.isNotBlank() &&
+                eventPkg != packageName &&
+                !isSoftKeyboardPackage(eventPkg)
+        ) {
+            val activeTarget =
+                if (isCooldownOverlayShowing) cooldownOverlayPackage else blockedOverlayPackage
+            if (activeTarget != null && eventPkg != activeTarget) {
+                removeContentBlockOverlay()
+            }
+        }
+
+        // --- V4 In-App Screen Guard Pipeline ---
+        if (
+            eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED ||
+                eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
+        ) {
+            pipeline.onAccessibilityEvent(eventPkg)
+        }
+    }
+
+    private fun handleV3TamperGuard(
+        eventType: Int?,
+        eventPkg: String,
+        repository: com.example.data.repository.ShieldRepository,
+    ) {
+        val now = SystemClock.elapsedRealtime()
+        if (eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            if (now - lastProcessedElapsedMs < CONTENT_CHANGED_DEBOUNCE_MS) {
+                return
+            }
+        }
+        lastProcessedElapsedMs = now
+
+        val launcherPkg = resolveLauncherPackage()
         val root = runCatching { rootInActiveWindow }.getOrNull()
         if (root == null) {
-            // Transient null root when IME pops up over overlay: do not blindly dismiss overlay;
-            // if switching away to a known non-guarded package, dismiss safely.
             if (
                 overlayView != null &&
-                    event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-                    eventPkg.isNotBlank() &&
-                    eventPkg !in PROTECTED_SETTINGS_PACKAGES &&
-                    !isSoftKeyboardPackage(eventPkg)
+                    eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                    eventPkg.isNotBlank()
             ) {
-                removeOverlay()
+                val isLauncher = launcherPkg != null && eventPkg == launcherPkg
+                val isExternalNonGuarded =
+                    eventPkg != packageName &&
+                        !isSoftKeyboardPackage(eventPkg) &&
+                        eventPkg !in PROTECTED_SETTINGS_PACKAGES
+                val elapsedSinceShown = now - overlayShownAtMs
+                if (
+                    isLauncher ||
+                        (isExternalNonGuarded && elapsedSinceShown >= OVERLAY_HYSTERESIS_MS)
+                ) {
+                    removeOverlay()
+                }
             }
             return
         }
 
         try {
             val activePkg = root.packageName?.toString().orEmpty().ifBlank { eventPkg }
-            val launcherPkg = cachedLauncherPackage
 
-            // Never cover own app, launcher, emergency calling apps, or non-guarded packages
+            // If overlay is already showing and the active window is our own package or a soft
+            // keyboard, return immediately without removing the overlay or walking the node tree.
             if (
-                activePkg.isBlank() ||
-                    activePkg == packageName ||
-                    activePkg == launcherPkg ||
-                    activePkg in SAFE_BYPASS_PACKAGES ||
-                    activePkg !in PROTECTED_SETTINGS_PACKAGES
+                overlayView != null &&
+                    (activePkg == packageName || isSoftKeyboardPackage(activePkg))
             ) {
+                return
+            }
+
+            // Never guard own app or soft keyboard when overlay is not showing
+            if (activePkg == packageName || isSoftKeyboardPackage(activePkg)) {
+                return
+            }
+
+            // Default launcher always dismisses the overlay immediately (even within hysteresis)
+            if (launcherPkg != null && activePkg == launcherPkg) {
                 removeOverlay()
+                return
+            }
+
+            val elapsedSinceShown = SystemClock.elapsedRealtime() - overlayShownAtMs
+
+            // Non-guarded package (neither own package, nor keyboard, nor in PROTECTED_SETTINGS_PACKAGES)
+            if (activePkg.isBlank() || activePkg !in PROTECTED_SETTINGS_PACKAGES) {
+                if (overlayView != null && elapsedSinceShown >= OVERLAY_HYSTERESIS_MS) {
+                    removeOverlay()
+                }
                 return
             }
 
@@ -126,7 +248,7 @@ class ShieldAccessibilityService : AccessibilityService() {
 
             if (shouldGuard) {
                 showOrUpdateOverlay(lockType, repository)
-            } else {
+            } else if (overlayView != null && elapsedSinceShown >= OVERLAY_HYSTERESIS_MS) {
                 removeOverlay()
             }
         } catch (_: Throwable) {
@@ -138,13 +260,393 @@ class ShieldAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {
         removeOverlay()
+        removeContentBlockOverlay()
+        screenGuardPipeline?.shutdown()
     }
 
     override fun onDestroy() {
         removeOverlay()
+        removeContentBlockOverlay()
+        screenGuardPipeline?.shutdown()
+        screenGuardPipeline = null
+        timerTicker?.stop()
+        timerTicker = null
         serviceScope.cancel()
         super.onDestroy()
         runCatching { ProtectionWatchdogReceiver.triggerAudit(applicationContext) }
+    }
+
+    private fun resolveLauncherPackage(): String? {
+        return cachedLauncherPackage
+            ?: ProtectionSystemChecker.getDefaultLauncherPackage(applicationContext)?.also {
+                cachedLauncherPackage = it
+            }
+    }
+
+    private fun ensureScreenGuardPipeline(
+        repository: com.example.data.repository.ShieldRepository
+    ): ScreenGuardPipeline {
+        val existing = screenGuardPipeline
+        if (existing != null) return existing
+        return ScreenGuardPipeline(
+                service = this,
+                repository = repository,
+                launcherPackageProvider = { resolveLauncherPackage() },
+                onTriggerBlock = { pkg, reason, hostOrPackage, durationMs, isTestScreen ->
+                    mainHandler.post {
+                        handleScreenGuardBlock(
+                            repository = repository,
+                            pkg = pkg,
+                            reason = reason,
+                            hostOrPackage = hostOrPackage,
+                            durationMs = durationMs,
+                            isTestScreen = isTestScreen,
+                        )
+                    }
+                },
+                onTriggerCooldownOverlay = { pkg, remainingMs ->
+                    mainHandler.post { showAppCooldownOverlay(pkg, remainingMs) }
+                },
+                onClearSearchField = { pkg ->
+                    mainHandler.post {
+                        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return@post
+                        try {
+                            screenGuardPipeline?.clearBlockedSearchFieldsInRoot(
+                                root = root,
+                                targetPkg = pkg,
+                                sensitivity = repository.getCachedScreenGuardSettings().sensitivity,
+                            )
+                        } finally {
+                            recycleSafely(root)
+                        }
+                    }
+                },
+            )
+            .also { screenGuardPipeline = it }
+    }
+
+    private fun handleScreenGuardBlock(
+        repository: com.example.data.repository.ShieldRepository,
+        pkg: String,
+        reason: ScreenGuardBlockReason,
+        hostOrPackage: String,
+        durationMs: Long,
+        isTestScreen: Boolean,
+    ) {
+        val pipeline = screenGuardPipeline ?: return
+        if (pipeline.rateLimiter.isInBlockCooldown(pkg)) {
+            return
+        }
+
+        val escalated =
+            if (!isTestScreen) {
+                pipeline.rateLimiter.recordBlockAndCheckEscalation(pkg)
+            } else {
+                pipeline.rateLimiter.recordBlockWithoutEscalation(pkg)
+                false
+            }
+
+        serviceScope.launch {
+            repository.recordScreenGuardBlock(
+                reason = reason,
+                hostOrPackage = hostOrPackage,
+                packageName = pkg,
+                durationMs = durationMs,
+            )
+        }
+
+        if (escalated) {
+            val remaining =
+                pipeline.rateLimiter
+                    .getAppEscalationCooldownRemainingMs(pkg)
+                    .coerceAtLeast(ScreenGuardRateLimiter.ESCALATION_COOLDOWN_MS)
+            showAppCooldownOverlay(pkg, remaining)
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            return
+        }
+
+        showTransientContentBlockOverlay(pkg)
+        performGlobalAction(GLOBAL_ACTION_BACK)
+
+        pendingBackRecheckRunnable?.let { mainHandler.removeCallbacks(it) }
+        val recheckRunnable =
+            Runnable {
+                pendingBackRecheckRunnable = null
+                val root = runCatching { rootInActiveWindow }.getOrNull() ?: return@Runnable
+                try {
+                    val activePkg = root.packageName?.toString().orEmpty()
+                    if (activePkg == pkg && pipeline.isRootStillAdult(root, pkg)) {
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                    }
+                } finally {
+                    recycleSafely(root)
+                }
+            }
+        pendingBackRecheckRunnable = recheckRunnable
+        mainHandler.postDelayed(recheckRunnable, BACK_RECHECK_DELAY_MS)
+    }
+
+    private fun showTransientContentBlockOverlay(pkg: String) {
+        if (isCooldownOverlayShowing && cooldownOverlayPackage == pkg) {
+            return
+        }
+        removeContentBlockOverlay()
+
+        val view = buildContentBlockOverlayView()
+        val params =
+            WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.OPAQUE,
+                )
+                .apply { gravity = Gravity.CENTER }
+
+        try {
+            val wm = windowManager ?: getSystemService(WindowManager::class.java)
+            wm?.addView(view, params)
+            windowManager = wm
+            contentBlockOverlayView = view
+            blockedOverlayPackage = pkg
+            isCooldownOverlayShowing = false
+
+            val dismissRunnable =
+                Runnable {
+                    pendingDismissBlockRunnable = null
+                    if (!isCooldownOverlayShowing) {
+                        removeContentBlockOverlay()
+                    }
+                }
+            pendingDismissBlockRunnable = dismissRunnable
+            mainHandler.postDelayed(dismissRunnable, BLOCK_OVERLAY_DURATION_MS)
+        } catch (_: Throwable) {
+            contentBlockOverlayView = null
+            blockedOverlayPackage = null
+            fallbackGoHome()
+        }
+    }
+
+    private fun showAppCooldownOverlay(pkg: String, remainingMs: Long) {
+        if (
+            contentBlockOverlayView != null &&
+                isCooldownOverlayShowing &&
+                cooldownOverlayPackage == pkg
+        ) {
+            cooldownMessageTextView?.text = formatCooldownMessage(remainingMs)
+            return
+        }
+        removeContentBlockOverlay()
+
+        val view = buildCooldownOverlayView(remainingMs)
+        val params =
+            WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.OPAQUE,
+                )
+                .apply { gravity = Gravity.CENTER }
+
+        try {
+            val wm = windowManager ?: getSystemService(WindowManager::class.java)
+            wm?.addView(view, params)
+            windowManager = wm
+            contentBlockOverlayView = view
+            cooldownOverlayPackage = pkg
+            isCooldownOverlayShowing = true
+            scheduleCooldownCountdownTick(pkg)
+        } catch (_: Throwable) {
+            contentBlockOverlayView = null
+            cooldownOverlayPackage = null
+            isCooldownOverlayShowing = false
+            fallbackGoHome()
+        }
+    }
+
+    private fun scheduleCooldownCountdownTick(pkg: String) {
+        pendingCooldownTickRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable =
+            object : Runnable {
+                override fun run() {
+                    if (!isCooldownOverlayShowing || cooldownOverlayPackage != pkg) return
+                    val rem =
+                        screenGuardPipeline?.rateLimiter?.getAppEscalationCooldownRemainingMs(pkg)
+                            ?: 0L
+                    if (rem <= 0L) {
+                        removeContentBlockOverlay()
+                    } else {
+                        cooldownMessageTextView?.text = formatCooldownMessage(rem)
+                        mainHandler.postDelayed(this, 1000L)
+                    }
+                }
+            }
+        pendingCooldownTickRunnable = runnable
+        mainHandler.postDelayed(runnable, 1000L)
+    }
+
+    private fun formatCooldownMessage(remainingMs: Long): String {
+        val totalSeconds = ((remainingMs + 999L) / 1000L).coerceAtLeast(1L)
+        val minutes = totalSeconds / 60L
+        val seconds = totalSeconds % 60L
+        return String.format(
+            "Screen Guard blocked adult content 3 times within 10 minutes. Cool down remaining: %02d:%02d.",
+            minutes,
+            seconds,
+        )
+    }
+
+    private fun removeContentBlockOverlay() {
+        pendingDismissBlockRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingDismissBlockRunnable = null
+        pendingCooldownTickRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingCooldownTickRunnable = null
+        val current = contentBlockOverlayView ?: return
+        contentBlockOverlayView = null
+        blockedOverlayPackage = null
+        cooldownOverlayPackage = null
+        isCooldownOverlayShowing = false
+        cooldownMessageTextView = null
+        runCatching { windowManager?.removeViewImmediate(current) }
+            .onFailure { runCatching { windowManager?.removeView(current) } }
+    }
+
+    private fun buildContentBlockOverlayView(): View {
+        val ctx: Context = this
+        val rootContainer =
+            FrameLayout(ctx).apply {
+                setBackgroundColor(Color.parseColor("#0B111E"))
+                isClickable = true
+            }
+        val card =
+            LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                val pad = dp(24)
+                setPadding(pad, pad, pad, pad)
+                background =
+                    GradientDrawable().apply {
+                        setColor(Color.parseColor("#131C2E"))
+                        cornerRadius = dp(20).toFloat()
+                        setStroke(dp(1), Color.parseColor("#FB7185"))
+                    }
+            }
+        val titleView =
+            TextView(ctx).apply {
+                text = getString(R.string.screen_guard_blocked_overlay)
+                setTextColor(Color.parseColor("#F8FAFC"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+        card.addView(titleView)
+
+        val subtitleView =
+            TextView(ctx).apply {
+                text = "Returning to a safe screen…"
+                setTextColor(Color.parseColor("#94A3B8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                gravity = Gravity.CENTER
+                setPadding(0, dp(10), 0, 0)
+            }
+        card.addView(subtitleView)
+
+        val cardLp =
+            FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER,
+                )
+                .apply {
+                    val margin = dp(24)
+                    setMargins(margin, margin, margin, margin)
+                }
+        rootContainer.addView(card, cardLp)
+        return rootContainer
+    }
+
+    private fun buildCooldownOverlayView(remainingMs: Long): View {
+        val ctx: Context = this
+        val rootContainer =
+            FrameLayout(ctx).apply {
+                setBackgroundColor(Color.parseColor("#0B111E"))
+                isClickable = true
+            }
+        val card =
+            LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                val pad = dp(24)
+                setPadding(pad, pad, pad, pad)
+                background =
+                    GradientDrawable().apply {
+                        setColor(Color.parseColor("#131C2E"))
+                        cornerRadius = dp(20).toFloat()
+                        setStroke(dp(1), Color.parseColor("#FBBF24"))
+                    }
+            }
+        val titleView =
+            TextView(ctx).apply {
+                text = getString(R.string.screen_guard_cooldown_title)
+                setTextColor(Color.parseColor("#F8FAFC"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+            }
+        card.addView(titleView)
+
+        val msgView =
+            TextView(ctx).apply {
+                text = formatCooldownMessage(remainingMs)
+                setTextColor(Color.parseColor("#CBD5E1"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                gravity = Gravity.CENTER
+                setPadding(0, dp(12), 0, dp(18))
+            }
+        cooldownMessageTextView = msgView
+        card.addView(msgView)
+
+        val goHomeBtn =
+            Button(ctx).apply {
+                text = getString(R.string.overlay_go_home)
+                isAllCaps = false
+                setTextColor(Color.parseColor("#042F2E"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                typeface = Typeface.DEFAULT_BOLD
+                background =
+                    GradientDrawable().apply {
+                        setColor(Color.parseColor("#34D399"))
+                        cornerRadius = dp(12).toFloat()
+                    }
+                minimumHeight = dp(48)
+                setOnClickListener {
+                    removeContentBlockOverlay()
+                    performGlobalAction(GLOBAL_ACTION_HOME)
+                }
+            }
+        card.addView(
+            goHomeBtn,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+
+        val cardLp =
+            FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER,
+                )
+                .apply {
+                    val margin = dp(24)
+                    setMargins(margin, margin, margin, margin)
+                }
+        rootContainer.addView(card, cardLp)
+        return rootContainer
     }
 
     private fun showOrUpdateOverlay(
@@ -178,10 +680,18 @@ class ShieldAccessibilityService : AccessibilityService() {
             windowManager = wm
             overlayView = view
             overlayLockTypeShown = lockType
+            overlayShownAtMs = SystemClock.elapsedRealtime()
+            view.requestFocus()
+            view.post {
+                if (overlayView === view && !view.hasFocus()) {
+                    view.requestFocus()
+                }
+            }
         } catch (_: Throwable) {
             // Fallback to GLOBAL_ACTION_HOME if overlay cannot be shown
             overlayView = null
             overlayLockTypeShown = null
+            overlayShownAtMs = 0L
             fallbackGoHome()
         }
     }
@@ -190,6 +700,7 @@ class ShieldAccessibilityService : AccessibilityService() {
         val current = overlayView ?: return
         overlayView = null
         overlayLockTypeShown = null
+        overlayShownAtMs = 0L
         statusTextView = null
         pinInputView = null
         submitPinButton = null
@@ -222,11 +733,33 @@ class ShieldAccessibilityService : AccessibilityService() {
     ): View {
         val ctx: Context = this
         val rootContainer =
-            FrameLayout(ctx).apply {
+            object : FrameLayout(ctx) {
+                override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                    if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+                        if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
+                            removeOverlay()
+                            performGlobalAction(GLOBAL_ACTION_HOME)
+                        }
+                        return true
+                    }
+                    return super.dispatchKeyEvent(event)
+                }
+            }.apply {
                 setBackgroundColor(Color.parseColor("#0B111E"))
                 isClickable = true
                 isFocusable = true
                 isFocusableInTouchMode = true
+                setOnKeyListener { _, keyCode, keyEvent ->
+                    if (keyCode == KeyEvent.KEYCODE_BACK) {
+                        if (keyEvent.action == KeyEvent.ACTION_UP && !keyEvent.isCanceled) {
+                            removeOverlay()
+                            performGlobalAction(GLOBAL_ACTION_HOME)
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
 
         val card =
@@ -430,10 +963,7 @@ class ShieldAccessibilityService : AccessibilityService() {
     }
 
     private fun isSoftKeyboardPackage(pkg: String): Boolean {
-        return pkg.contains("inputmethod", ignoreCase = true) ||
-            pkg.contains("keyboard", ignoreCase = true) ||
-            pkg.contains("gboard", ignoreCase = true) ||
-            pkg.contains("honeyboard", ignoreCase = true)
+        return ScreenGuardExclusions.isSoftKeyboardPackage(pkg)
     }
 
     private fun matchesGuardedScreen(
@@ -508,6 +1038,11 @@ class ShieldAccessibilityService : AccessibilityService() {
         private const val MAX_CHILDREN_PER_NODE = 64
         private const val BOUNCE_COOLDOWN_MS = 750L
         private const val TOAST_COOLDOWN_MS = 2000L
+        private const val OVERLAY_HYSTERESIS_MS = 1000L
+        private const val CONTENT_CHANGED_DEBOUNCE_MS = 200L
+        private const val BLOCK_OVERLAY_DURATION_MS = 2000L
+        private const val BACK_RECHECK_DELAY_MS = 1000L
+        private const val TIMER_EVENT_REFRESH_INTERVAL_MS = 3000L
 
         val PROTECTED_SETTINGS_PACKAGES =
             setOf(
@@ -524,16 +1059,6 @@ class ShieldAccessibilityService : AccessibilityService() {
                 "com.vivo.permissionmanager",
                 "com.iqoo.secure",
                 "com.vivo.settings",
-            )
-
-        private val SAFE_BYPASS_PACKAGES =
-            setOf(
-                "com.android.phone",
-                "com.android.server.telecom",
-                "com.android.incallui",
-                "com.google.android.dialer",
-                "com.samsung.android.incallui",
-                "com.android.dialer",
             )
     }
 }

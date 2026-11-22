@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.dns.GeminiDomainClassifier
 import com.example.dns.UnsurePolicy
@@ -16,6 +17,8 @@ import com.example.protection.LockType
 import com.example.protection.PersistedTamperState
 import com.example.protection.ProtectionMode
 import com.example.protection.ProtectionStateStore
+import com.example.protection.ScreenGuardSensitivity
+import com.example.protection.ScreenGuardSettings
 import com.example.protection.WaitDurationOption
 import java.io.IOException
 import java.time.LocalDate
@@ -37,6 +40,7 @@ data class ShieldStatsSnapshot(
     val geminiModel: String = GeminiDomainClassifier.DEFAULT_MODEL,
     val whenUnsure: UnsurePolicy = UnsurePolicy.ALLOW,
     val wizardPromptedAfterOnboarding: Boolean = false,
+    val screenGuardSettings: ScreenGuardSettings = ScreenGuardSettings(),
 )
 
 class ShieldPreferences(private val context: Context) : ProtectionStateStore {
@@ -73,6 +77,16 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
         val FAILED_PIN_ATTEMPTS = intPreferencesKey("tamper_failed_pin_attempts")
         val LOCKOUT_TIER = intPreferencesKey("tamper_lockout_tier")
         val LOCKOUT_REMAINING_MS = longPreferencesKey("tamper_lockout_remaining_ms")
+
+        // V4 Screen Guard keys
+        val SG_MASTER_ENABLED = booleanPreferencesKey("sg_master_enabled")
+        val SG_URL_CHECK_ENABLED = booleanPreferencesKey("sg_url_check_enabled")
+        val SG_TEXT_SCORING_ENABLED = booleanPreferencesKey("sg_text_scoring_enabled")
+        val SG_SEARCH_GUARD_ENABLED = booleanPreferencesKey("sg_search_guard_enabled")
+        val SG_VISUAL_CHECK_ENABLED = booleanPreferencesKey("sg_visual_check_enabled")
+        val SG_SENSITIVITY = stringPreferencesKey("sg_sensitivity")
+        val SG_MONITOR_ALL_APPS = booleanPreferencesKey("sg_monitor_all_apps")
+        val SG_ALLOWED_APPS = stringSetPreferencesKey("sg_allowed_apps")
     }
 
     val snapshotFlow: Flow<ShieldStatsSnapshot> =
@@ -103,6 +117,18 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
                     whenUnsure = UnsurePolicy.fromStored(prefs[Keys.WHEN_UNSURE]),
                     wizardPromptedAfterOnboarding =
                         prefs[Keys.WIZARD_PROMPTED_AFTER_ONBOARDING] ?: false,
+                    screenGuardSettings =
+                        ScreenGuardSettings(
+                            masterEnabled = prefs[Keys.SG_MASTER_ENABLED] ?: true,
+                            urlCheckEnabled = prefs[Keys.SG_URL_CHECK_ENABLED] ?: true,
+                            textScoringEnabled = prefs[Keys.SG_TEXT_SCORING_ENABLED] ?: true,
+                            searchGuardEnabled = prefs[Keys.SG_SEARCH_GUARD_ENABLED] ?: true,
+                            visualCheckEnabled = prefs[Keys.SG_VISUAL_CHECK_ENABLED] ?: false,
+                            sensitivity =
+                                ScreenGuardSensitivity.fromStored(prefs[Keys.SG_SENSITIVITY]),
+                            monitorAllApps = prefs[Keys.SG_MONITOR_ALL_APPS] ?: true,
+                            allowedApps = prefs[Keys.SG_ALLOWED_APPS] ?: emptySet(),
+                        ),
                 )
             }
 
@@ -192,6 +218,31 @@ class ShieldPreferences(private val context: Context) : ProtectionStateStore {
 
     suspend fun setWhenUnsure(policy: UnsurePolicy) {
         context.shieldDataStore.edit { prefs -> prefs[Keys.WHEN_UNSURE] = policy.name }
+    }
+
+    suspend fun updateScreenGuardSettings(transform: (ScreenGuardSettings) -> ScreenGuardSettings) {
+        context.shieldDataStore.edit { prefs ->
+            val current =
+                ScreenGuardSettings(
+                    masterEnabled = prefs[Keys.SG_MASTER_ENABLED] ?: true,
+                    urlCheckEnabled = prefs[Keys.SG_URL_CHECK_ENABLED] ?: true,
+                    textScoringEnabled = prefs[Keys.SG_TEXT_SCORING_ENABLED] ?: true,
+                    searchGuardEnabled = prefs[Keys.SG_SEARCH_GUARD_ENABLED] ?: true,
+                    visualCheckEnabled = prefs[Keys.SG_VISUAL_CHECK_ENABLED] ?: false,
+                    sensitivity = ScreenGuardSensitivity.fromStored(prefs[Keys.SG_SENSITIVITY]),
+                    monitorAllApps = prefs[Keys.SG_MONITOR_ALL_APPS] ?: true,
+                    allowedApps = prefs[Keys.SG_ALLOWED_APPS] ?: emptySet(),
+                )
+            val updated = transform(current)
+            prefs[Keys.SG_MASTER_ENABLED] = updated.masterEnabled
+            prefs[Keys.SG_URL_CHECK_ENABLED] = updated.urlCheckEnabled
+            prefs[Keys.SG_TEXT_SCORING_ENABLED] = updated.textScoringEnabled
+            prefs[Keys.SG_SEARCH_GUARD_ENABLED] = updated.searchGuardEnabled
+            prefs[Keys.SG_VISUAL_CHECK_ENABLED] = updated.visualCheckEnabled
+            prefs[Keys.SG_SENSITIVITY] = updated.sensitivity.name
+            prefs[Keys.SG_MONITOR_ALL_APPS] = updated.monitorAllApps
+            prefs[Keys.SG_ALLOWED_APPS] = updated.allowedApps
+        }
     }
 
     suspend fun incrementBlockedCountersBy(delta: Long) {

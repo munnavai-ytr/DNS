@@ -201,6 +201,62 @@ class DnsDecisionEngine(
     }
 
     /**
+     * Layer A Browser URL Check: evaluates a raw URL or domain string through the safe list,
+     * blocklist, custom rules, keyword hit, verdict cache, and (when enabled) 3-second AI check.
+     */
+    suspend fun evaluateUrlDomain(rawUrlOrDomain: String): DomainCheckSummary? {
+        val startNs = System.nanoTime()
+        val domain = DomainFilterEngine.normalizeDomain(rawUrlOrDomain) ?: return null
+        val registrable = DomainUtils.extractRegistrableDomain(domain)
+
+        if (filterEngine.isAlwaysAllowedInternalHost(domain) || filterEngine.isWhitelisted(domain)) {
+            return DomainCheckSummary(domain, registrable, DomainVerdict.SAFE, "Whitelist", elapsedMs(startNs))
+        }
+        if (filterEngine.isSafeListed(domain)) {
+            return DomainCheckSummary(domain, registrable, DomainVerdict.SAFE, "Safe list", elapsedMs(startNs))
+        }
+
+        val instantBlock = filterEngine.matchInstantBlock(domain)
+        if (instantBlock != null) {
+            return DomainCheckSummary(domain, registrable, DomainVerdict.ADULT, instantBlock.label, elapsedMs(startNs))
+        }
+
+        val cached = verdictCache.get(registrable)
+        if (cached != null) {
+            return DomainCheckSummary(
+                domain = domain,
+                registrableDomain = registrable,
+                verdict = cached.verdict,
+                reasonLabel = "Cache",
+                latencyMs = elapsedMs(startNs),
+            )
+        }
+
+        val settings = settingsProvider()
+        if (!settings.aiVerificationEnabled || !settings.hasApiKey) {
+            return DomainCheckSummary(domain, registrable, DomainVerdict.SAFE, "Allowed", elapsedMs(startNs))
+        }
+
+        val aiOutcome = verifyRegistrableDomainSingleFlight(registrable)
+        val verdict =
+            when {
+                aiOutcome.verdict == DomainVerdict.ADULT && aiOutcome.confidence >= ADULT_THRESHOLD ->
+                    DomainVerdict.ADULT
+                aiOutcome.verdict == DomainVerdict.SAFE -> DomainVerdict.SAFE
+                settings.whenUnsure == UnsurePolicy.BLOCK -> DomainVerdict.ADULT
+                else -> DomainVerdict.SAFE
+            }
+        return DomainCheckSummary(
+            domain = domain,
+            registrableDomain = registrable,
+            verdict = verdict,
+            reasonLabel = if (verdict == DomainVerdict.ADULT) "AI" else "AI (SAFE)",
+            latencyMs = elapsedMs(startNs),
+            errorDetail = aiOutcome.errorMessage,
+        )
+    }
+
+    /**
      * Manual domain check used by Settings ("Check a domain" box). Never opens or visits the domain.
      */
     suspend fun inspectDomainManually(rawDomain: String): DomainCheckSummary {

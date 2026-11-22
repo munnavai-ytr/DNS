@@ -7,4 +7,5 @@ data class BlockedLogEntity(
     val reason: String = "Blocklist",
     val durationMs: Long = 0L,
     val timestamp: Long = System.currentTimeMillis(),
+    val packageName: String = "",
 )

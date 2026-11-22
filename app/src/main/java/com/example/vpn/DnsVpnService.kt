@@ -26,6 +26,7 @@ import com.example.dns.ParsedUdpPacket
 import com.example.dns.UpstreamDnsForwarder
 import com.example.dns.UpstreamDnsResult
 import com.example.protection.ProtectionMode
+import com.example.protection.ProtectionTimerTicker
 import com.example.protection.ProtectionWatchdogReceiver
 import com.example.receiver.ServiceRestartReceiver
 import java.io.FileInputStream
@@ -62,6 +63,7 @@ class DnsVpnService : VpnService() {
     @Volatile private var latestBlockedToday = 0L
     @Volatile private var lastNotificationUpdateElapsedMs = 0L
     private var pendingNotificationJob: Job? = null
+    private var timerTicker: ProtectionTimerTicker? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -70,6 +72,11 @@ class DnsVpnService : VpnService() {
         upstreamForwarder = UpstreamDnsForwarder { socket -> protect(socket) }
         createNotificationChannel()
         publishVpnSecurityFlags()
+
+        timerTicker =
+            ProtectionTimerTicker(scope = serviceScope, repository = repository).also {
+                it.startObserving()
+            }
 
         serviceScope.launch {
             repository.statsSnapshot
@@ -449,6 +456,8 @@ class DnsVpnService : VpnService() {
         val shouldRestart = (!userStoppedExplicitly || guardVpn) &&
             repository.getCachedProtectionMode() == ProtectionMode.VPN
         stopVpnTunnel()
+        timerTicker?.stop()
+        timerTicker = null
         serviceScope.cancel()
         if (shouldRestart) {
             scheduleRestartIfNeeded()

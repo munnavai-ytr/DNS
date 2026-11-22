@@ -1,0 +1,159 @@
+# DNS Shield V4 Adult Content Keywords
+# Format: term|weight (weight 1-5)
+# Lines starting with # are comments.
+
+# Fixed self-test term (weight 5)
+dnsshieldtestword|5
+
+# Explicit English terms & domains (weight 5)
+porn|5
+porno|5
+pornography|5
+pornhub|5
+xvideos|5
+xnxx|5
+xhamster|5
+redtube|5
+youporn|5
+spankbang|5
+chaturbate|5
+stripchat|5
+bongacams|5
+myfreecams|5
+onlyfans|5
+brazzers|5
+bangbros|5
+hentai|5
+nhentai|5
+rule34|5
+blowjob|5
+handjob|5
+gangbang|5
+deepthroat|5
+creampie|5
+cumshot|5
+masturbate|5
+masturbation|5
+fapello|5
+incest|5
+nsfw|5
+xxx|5
+erotica|5
+hardcore porn|5
+fuck|5
+pussy|5
+cock|5
+dick|5
+boobs|5
+tits|5
+cunt|5
+whore|5
+slut|5
+bdsm|5
+milf|5
+dildo|5
+vibrator|5
+sex video|5
+porn video|5
+adult video|5
+camgirl|5
+sexchat|5
+livesex|5
+
+# Moderate/suggestive English terms (weights 2-4)
+nude|4
+nudes|4
+nudity|4
+naked|3
+horny|4
+fetish|4
+threesome|4
+orgasm|4
+erotic|3
+stripper|3
+escort|3
+sextape|5
+sexting|4
+uncensored|2
+sexy|2
+lingerie|2
+cleavage|2
+bikini|1
+hot girl|2
+adults only|3
+18+|2
+
+# Bengali script adult terms (weights 2-5)
+পর্ন|5
+পর্নোগ্রাফি|5
+চোদা|5
+চুদা|5
+চুদাচুদি|5
+চোদাচুদি|5
+চুদ|5
+মাগি|5
+খানকি|5
+রান্ডি|5
+বেশ্যা|5
+ধোন|5
+গুদ|5
+ভোদা|5
+হস্তমৈথুন|5
+ব্লু ফিল্ম|5
+সেক্স ভিডিও|5
+নগ্ন ভিডিও|5
+নগ্নতা|4
+নগ্ন|3
+যৌন|3
+অশ্লীল|3
+কামুক|3
+চটি গল্প|5
+বাংলা চটি|5
+সেক্স|4
+কাম|2
+
+# Banglish (Bengali in Latin letters, weights 2-5)
+choda|5
+chodachudi|5
+chuda|5
+chudi|5
+chudachudi|5
+magi|5
+khanki|5
+randi|5
+beshya|5
+besha|5
+dhon|5
+gud|5
+bhoda|5
+voda|5
+nunu|4
+chut|5
+jouno|3
+oshlil|3
+kamuk|3
+choti|4
+choti golpo|5
+bangla choti|5
+bangla sex|5
+desi bhabhi|4
+desi bhabi|4
+boudi sex|5
+masala video|3
+blue film|5
+bf video|4
+sexy boudi|4
+sexi|2
+
+# Common explicit obfuscation patterns
+p0rn|5
+s3x|4
+pr0n|5
+phub|4
+xvid|4
+xham|4
+f4p|4
+n00ds|4
+nud3|4
+bo0bs|5
+puss1|5
