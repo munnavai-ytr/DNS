@@ -20,7 +20,6 @@ class DnsShieldDatabase private constructor(context: Context) :
     private val rulesFlow = MutableStateFlow<List<CustomRuleEntity>>(emptyList())
 
     init {
-        // Hydrate initial flows safely
         runCatching {
             logsFlow.value = queryRecentLogsSync()
             rulesFlow.value = queryAllRulesSync()
@@ -34,6 +33,8 @@ class DnsShieldDatabase private constructor(context: Context) :
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 domain TEXT NOT NULL,
                 query_type TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'Blocklist',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
                 timestamp INTEGER NOT NULL
             )
             """.trimIndent()
@@ -52,9 +53,18 @@ class DnsShieldDatabase private constructor(context: Context) :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_LOGS")
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_RULES")
-        onCreate(db)
+        if (oldVersion < 2) {
+            runCatching {
+                db.execSQL(
+                    "ALTER TABLE $TABLE_LOGS ADD COLUMN reason TEXT NOT NULL DEFAULT 'Blocklist'"
+                )
+            }
+            runCatching {
+                db.execSQL(
+                    "ALTER TABLE $TABLE_LOGS ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
     }
 
     fun observeRecentLogs(): Flow<List<BlockedLogEntity>> = logsFlow.asStateFlow()
@@ -74,6 +84,8 @@ class DnsShieldDatabase private constructor(context: Context) :
                         ContentValues().apply {
                             put("domain", entry.domain)
                             put("query_type", entry.queryType)
+                            put("reason", entry.reason)
+                            put("duration_ms", entry.durationMs)
                             put("timestamp", entry.timestamp)
                         }
                     db.insert(TABLE_LOGS, null, values)
@@ -136,13 +148,15 @@ class DnsShieldDatabase private constructor(context: Context) :
         val result = ArrayList<BlockedLogEntity>(MAX_LOG_ENTRIES)
         readableDatabase
             .rawQuery(
-                "SELECT id, domain, query_type, timestamp FROM $TABLE_LOGS ORDER BY timestamp DESC, id DESC LIMIT $MAX_LOG_ENTRIES",
+                "SELECT id, domain, query_type, reason, duration_ms, timestamp FROM $TABLE_LOGS ORDER BY timestamp DESC, id DESC LIMIT $MAX_LOG_ENTRIES",
                 null,
             )
             .use { cursor ->
                 val idIdx = cursor.getColumnIndexOrThrow("id")
                 val domainIdx = cursor.getColumnIndexOrThrow("domain")
                 val typeIdx = cursor.getColumnIndexOrThrow("query_type")
+                val reasonIdx = cursor.getColumnIndexOrThrow("reason")
+                val durationIdx = cursor.getColumnIndexOrThrow("duration_ms")
                 val tsIdx = cursor.getColumnIndexOrThrow("timestamp")
                 while (cursor.moveToNext()) {
                     result.add(
@@ -150,6 +164,8 @@ class DnsShieldDatabase private constructor(context: Context) :
                             id = cursor.getLong(idIdx),
                             domain = cursor.getString(domainIdx),
                             queryType = cursor.getString(typeIdx),
+                            reason = cursor.getString(reasonIdx),
+                            durationMs = cursor.getLong(durationIdx),
                             timestamp = cursor.getLong(tsIdx),
                         )
                     )
@@ -184,7 +200,7 @@ class DnsShieldDatabase private constructor(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "dns_shield.db"
-        private const val DATABASE_VERSION = 1
+        private const val DATABASE_VERSION = 2
         private const val TABLE_LOGS = "blocked_logs"
         private const val TABLE_RULES = "custom_rules"
         private const val MAX_LOG_ENTRIES = 200

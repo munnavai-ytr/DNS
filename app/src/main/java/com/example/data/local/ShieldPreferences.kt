@@ -7,7 +7,10 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.dns.GeminiDomainClassifier
+import com.example.dns.UnsurePolicy
 import java.io.IOException
 import java.time.LocalDate
 import kotlinx.coroutines.flow.Flow
@@ -23,6 +26,10 @@ data class ShieldStatsSnapshot(
     val vpnDesiredEnabled: Boolean = false,
     val totalBlocked: Long = 0L,
     val blockedToday: Long = 0L,
+    val aiVerificationEnabled: Boolean = true,
+    val geminiApiKey: String = "",
+    val geminiModel: String = GeminiDomainClassifier.DEFAULT_MODEL,
+    val whenUnsure: UnsurePolicy = UnsurePolicy.ALLOW,
 )
 
 class ShieldPreferences(private val context: Context) {
@@ -32,6 +39,10 @@ class ShieldPreferences(private val context: Context) {
         val TOTAL_BLOCKED = longPreferencesKey("total_blocked")
         val BLOCKED_TODAY = longPreferencesKey("blocked_today")
         val BLOCKED_TODAY_EPOCH_DAY = longPreferencesKey("blocked_today_epoch_day")
+        val AI_VERIFICATION_ENABLED = booleanPreferencesKey("ai_verification_enabled")
+        val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
+        val GEMINI_MODEL = stringPreferencesKey("gemini_model")
+        val WHEN_UNSURE = stringPreferencesKey("when_unsure")
     }
 
     val snapshotFlow: Flow<ShieldStatsSnapshot> =
@@ -48,11 +59,18 @@ class ShieldPreferences(private val context: Context) {
                     } else {
                         0L
                     }
+                val storedModel =
+                    prefs[Keys.GEMINI_MODEL]?.trim()?.ifEmpty { GeminiDomainClassifier.DEFAULT_MODEL }
+                        ?: GeminiDomainClassifier.DEFAULT_MODEL
                 ShieldStatsSnapshot(
                     onboardingCompleted = prefs[Keys.ONBOARDING_COMPLETED] ?: false,
                     vpnDesiredEnabled = prefs[Keys.VPN_DESIRED_ENABLED] ?: false,
                     totalBlocked = prefs[Keys.TOTAL_BLOCKED] ?: 0L,
                     blockedToday = todayCount,
+                    aiVerificationEnabled = prefs[Keys.AI_VERIFICATION_ENABLED] ?: true,
+                    geminiApiKey = prefs[Keys.GEMINI_API_KEY] ?: "",
+                    geminiModel = storedModel,
+                    whenUnsure = UnsurePolicy.fromStored(prefs[Keys.WHEN_UNSURE]),
                 )
             }
 
@@ -66,6 +84,23 @@ class ShieldPreferences(private val context: Context) {
 
     suspend fun setVpnDesiredEnabled(enabled: Boolean) {
         context.shieldDataStore.edit { prefs -> prefs[Keys.VPN_DESIRED_ENABLED] = enabled }
+    }
+
+    suspend fun setAiVerificationEnabled(enabled: Boolean) {
+        context.shieldDataStore.edit { prefs -> prefs[Keys.AI_VERIFICATION_ENABLED] = enabled }
+    }
+
+    suspend fun setGeminiApiKey(apiKey: String) {
+        context.shieldDataStore.edit { prefs -> prefs[Keys.GEMINI_API_KEY] = apiKey.trim() }
+    }
+
+    suspend fun setGeminiModel(model: String) {
+        val cleaned = model.trim().ifEmpty { GeminiDomainClassifier.DEFAULT_MODEL }
+        context.shieldDataStore.edit { prefs -> prefs[Keys.GEMINI_MODEL] = cleaned }
+    }
+
+    suspend fun setWhenUnsure(policy: UnsurePolicy) {
+        context.shieldDataStore.edit { prefs -> prefs[Keys.WHEN_UNSURE] = policy.name }
     }
 
     suspend fun incrementBlockedCounters() {

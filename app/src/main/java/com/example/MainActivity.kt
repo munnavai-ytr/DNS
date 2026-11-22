@@ -342,6 +342,15 @@ private fun DnsShieldApp(viewModel: MainViewModel) {
                     composable(ROUTE_SETTINGS) {
                         SettingsScreen(
                             uiState = uiState,
+                            onToggleAiVerification = { enabled ->
+                                viewModel.setAiVerificationEnabled(enabled)
+                            },
+                            onSaveApiKey = { key -> viewModel.saveGeminiApiKey(key) },
+                            onSaveModel = { model -> viewModel.saveGeminiModel(model) },
+                            onChangeWhenUnsure = { policy -> viewModel.setWhenUnsure(policy) },
+                            onTestAiConnection = { viewModel.testAiConnection() },
+                            onClearCache = { viewModel.clearVerdictCache() },
+                            onCheckDomain = { domain -> viewModel.checkDomain(domain) },
                             onAddCustomBlock = { domain ->
                                 viewModel.addCustomRule(domain, isWhitelist = false)
                             },

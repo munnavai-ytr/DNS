@@ -10,14 +10,17 @@ import com.example.DnsShieldApplication
 import com.example.data.local.BlockedLogEntity
 import com.example.data.local.CustomRuleEntity
 import com.example.data.local.ShieldStatsSnapshot
+import com.example.dns.DomainCheckSummary
 import com.example.dns.DomainFilterEngine
+import com.example.dns.DomainVerdict
+import com.example.dns.GeminiDomainClassifier
+import com.example.dns.UnsurePolicy
 import com.example.vpn.DnsVpnService
 import java.net.InetAddress
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -34,6 +37,22 @@ sealed interface SelfTestState {
     data class NotWorking(val reason: String) : SelfTestState
 }
 
+sealed interface AiTestState {
+    data object Idle : AiTestState
+
+    data object Running : AiTestState
+
+    data class Result(val message: String, val isSuccess: Boolean) : AiTestState
+}
+
+sealed interface DomainCheckState {
+    data object Idle : DomainCheckState
+
+    data object Checking : DomainCheckState
+
+    data class Result(val summary: DomainCheckSummary) : DomainCheckState
+}
+
 data class SystemPermissionState(
     val hasVpnPermission: Boolean = false,
     val isBatteryOptimizationIgnored: Boolean = false,
@@ -47,10 +66,18 @@ data class MainUiState(
     val blockedToday: Long = 0L,
     val totalBlocked: Long = 0L,
     val baseRuleCount: Int = 0,
+    val safeRuleCount: Int = 0,
+    val cacheSize: Int = 0,
+    val aiVerificationEnabled: Boolean = true,
+    val geminiApiKey: String = "",
+    val geminiModel: String = GeminiDomainClassifier.DEFAULT_MODEL,
+    val whenUnsure: UnsurePolicy = UnsurePolicy.ALLOW,
     val logs: List<BlockedLogEntity> = emptyList(),
     val customBlockedRules: List<CustomRuleEntity> = emptyList(),
     val whitelistRules: List<CustomRuleEntity> = emptyList(),
     val selfTestState: SelfTestState = SelfTestState.Idle,
+    val aiTestState: AiTestState = AiTestState.Idle,
+    val domainCheckState: DomainCheckState = DomainCheckState.Idle,
     val permissions: SystemPermissionState = SystemPermissionState(),
     val ruleFeedbackMessage: String? = null,
 )
@@ -60,6 +87,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = app.repository
 
     private val selfTestState = MutableStateFlow<SelfTestState>(SelfTestState.Idle)
+    private val aiTestState = MutableStateFlow<AiTestState>(AiTestState.Idle)
+    private val domainCheckState = MutableStateFlow<DomainCheckState>(DomainCheckState.Idle)
     private val permissionState = MutableStateFlow(readSystemPermissions(application))
     private val ruleFeedback = MutableStateFlow<String?>(null)
 
@@ -80,12 +109,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selfTestState,
             permissionState,
             ruleFeedback,
-        ) { whitelist, selfTest, perms, feedback ->
-            SecondarySlice(whitelist, selfTest, perms, feedback)
+            repository.cacheSize,
+        ) { whitelist, selfTest, perms, feedback, cacheCount ->
+            SecondarySlice(whitelist, selfTest, perms, feedback, cacheCount)
+        }
+
+    private val v2ToolStateFlow =
+        combine(
+            repository.safeRuleCount,
+            aiTestState,
+            domainCheckState,
+        ) { safeCount, aiTest, domainCheck ->
+            V2ToolSlice(safeCount, aiTest, domainCheck)
         }
 
     val uiState: StateFlow<MainUiState> =
-        combine(baseStateFlow, secondaryStateFlow) { base, secondary ->
+        combine(baseStateFlow, secondaryStateFlow, v2ToolStateFlow) { base, secondary, v2 ->
                 MainUiState(
                     isReady = true,
                     onboardingCompleted = base.stats.onboardingCompleted,
@@ -94,10 +133,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     blockedToday = base.stats.blockedToday,
                     totalBlocked = base.stats.totalBlocked,
                     baseRuleCount = base.baseCount,
+                    safeRuleCount = v2.safeCount,
+                    cacheSize = secondary.cacheCount,
+                    aiVerificationEnabled = base.stats.aiVerificationEnabled,
+                    geminiApiKey = base.stats.geminiApiKey,
+                    geminiModel = base.stats.geminiModel,
+                    whenUnsure = base.stats.whenUnsure,
                     logs = base.logs,
                     customBlockedRules = base.customBlocked,
                     whitelistRules = secondary.whitelist,
                     selfTestState = secondary.selfTest,
+                    aiTestState = v2.aiTest,
+                    domainCheckState = v2.domainCheck,
                     permissions = secondary.perms,
                     ruleFeedbackMessage = secondary.feedback,
                 )
@@ -186,6 +233,62 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setAiVerificationEnabled(enabled: Boolean) {
+        viewModelScope.launch { repository.setAiVerificationEnabled(enabled) }
+    }
+
+    fun saveGeminiApiKey(apiKey: String) {
+        viewModelScope.launch {
+            repository.setGeminiApiKey(apiKey)
+            ruleFeedback.value =
+                if (apiKey.isBlank()) "Gemini API key cleared" else "Gemini API key saved"
+        }
+    }
+
+    fun saveGeminiModel(model: String) {
+        viewModelScope.launch {
+            repository.setGeminiModel(model)
+            ruleFeedback.value = "Model updated"
+        }
+    }
+
+    fun setWhenUnsure(policy: UnsurePolicy) {
+        viewModelScope.launch { repository.setWhenUnsure(policy) }
+    }
+
+    fun clearVerdictCache() {
+        repository.clearVerdictCache()
+        ruleFeedback.value = "Verdict cache cleared"
+    }
+
+    fun testAiConnection() {
+        aiTestState.value = AiTestState.Running
+        viewModelScope.launch {
+            val (result, elapsedMs) = repository.testAiConnection()
+            aiTestState.value =
+                if (result.errorMessage != null) {
+                    AiTestState.Result(message = result.errorMessage, isSuccess = false)
+                } else {
+                    AiTestState.Result(
+                        message = "Working, ${result.verdict.name}, $elapsedMs ms",
+                        isSuccess = result.verdict != DomainVerdict.UNSURE,
+                    )
+                }
+        }
+    }
+
+    fun checkDomain(rawDomain: String) {
+        if (rawDomain.isBlank()) {
+            ruleFeedback.value = "Enter a domain to check"
+            return
+        }
+        domainCheckState.value = DomainCheckState.Checking
+        viewModelScope.launch {
+            val summary = withContext(Dispatchers.IO) { repository.inspectDomainManually(rawDomain) }
+            domainCheckState.value = DomainCheckState.Result(summary)
+        }
+    }
+
     fun addCustomRule(rawDomain: String, isWhitelist: Boolean) {
         viewModelScope.launch {
             val added = repository.addCustomRule(rawDomain, isWhitelist)
@@ -244,5 +347,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val selfTest: SelfTestState,
         val perms: SystemPermissionState,
         val feedback: String?,
+        val cacheCount: Int,
+    )
+
+    private data class V2ToolSlice(
+        val safeCount: Int,
+        val aiTest: AiTestState,
+        val domainCheck: DomainCheckState,
     )
 }

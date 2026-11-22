@@ -9,9 +9,13 @@ class DomainFilterEngine {
         val baseBlocked: HashSet<String> = HashSet(),
         val customBlocked: HashSet<String> = HashSet(),
         val whitelist: HashSet<String> = HashSet(),
+        val safeDomains: HashSet<String> = HashSet(),
     ) {
         val totalBlockRuleCount: Int
             get() = baseBlocked.size + customBlocked.size
+
+        val safeRuleCount: Int
+            get() = safeDomains.size
     }
 
     private val snapshotRef = AtomicReference(FilterSnapshot())
@@ -19,14 +23,7 @@ class DomainFilterEngine {
     fun getSnapshot(): FilterSnapshot = snapshotRef.get()
 
     fun loadBaseBlocklistFromAssets(context: Context, assetName: String = "blocklist.txt"): Int {
-        val loaded = HashSet<String>(128)
-        runCatching {
-            context.assets.open(assetName).bufferedReader().useLines { lines ->
-                lines.forEach { rawLine ->
-                    parseBlocklistLine(rawLine)?.let { domain -> loaded.add(domain) }
-                }
-            }
-        }
+        val loaded = loadDomainSetFromAsset(context, assetName)
         while (true) {
             val current = snapshotRef.get()
             val updated = current.copy(baseBlocked = loaded)
@@ -35,7 +32,40 @@ class DomainFilterEngine {
         return loaded.size
     }
 
-    fun updateDynamicRules(customBlockedDomains: Collection<String>, whitelistedDomains: Collection<String>) {
+    fun loadSafeDomainsFromAssets(context: Context, assetName: String = "safe_domains.txt"): Int {
+        val loaded = loadDomainSetFromAsset(context, assetName)
+        while (true) {
+            val current = snapshotRef.get()
+            val updated = current.copy(safeDomains = loaded)
+            if (snapshotRef.compareAndSet(current, updated)) break
+        }
+        return loaded.size
+    }
+
+    fun updateSafeDomainsForTesting(safeDomains: Collection<String>) {
+        val set = HashSet<String>(safeDomains.size)
+        safeDomains.forEach { raw -> normalizeDomain(raw)?.let { set.add(it) } }
+        while (true) {
+            val current = snapshotRef.get()
+            val updated = current.copy(safeDomains = set)
+            if (snapshotRef.compareAndSet(current, updated)) break
+        }
+    }
+
+    fun updateBaseBlockedForTesting(baseBlocked: Collection<String>) {
+        val set = HashSet<String>(baseBlocked.size)
+        baseBlocked.forEach { raw -> normalizeDomain(raw)?.let { set.add(it) } }
+        while (true) {
+            val current = snapshotRef.get()
+            val updated = current.copy(baseBlocked = set)
+            if (snapshotRef.compareAndSet(current, updated)) break
+        }
+    }
+
+    fun updateDynamicRules(
+        customBlockedDomains: Collection<String>,
+        whitelistedDomains: Collection<String>,
+    ) {
         val customSet = HashSet<String>(customBlockedDomains.size)
         customBlockedDomains.forEach { raw -> normalizeDomain(raw)?.let { customSet.add(it) } }
 
@@ -49,19 +79,60 @@ class DomainFilterEngine {
         }
     }
 
+    fun isAlwaysAllowedInternalHost(rawDomain: String): Boolean {
+        val domain = normalizeDomainFast(rawDomain) ?: return false
+        return domain == GeminiDomainClassifier.GEMINI_API_HOST
+    }
+
+    fun isWhitelisted(rawDomain: String): Boolean {
+        val domain = normalizeDomainFast(rawDomain) ?: return false
+        return matchesDomainOrParent(domain, snapshotRef.get().whitelist)
+    }
+
+    fun isSafeListed(rawDomain: String): Boolean {
+        val domain = normalizeDomainFast(rawDomain) ?: return false
+        return matchesDomainOrParent(domain, snapshotRef.get().safeDomains)
+    }
+
     /**
-     * Checks if [rawDomain] or any of its parent domains is blocked.
-     * Whitelist entries (including parent domain matches) always override the blocklist.
+     * Checks Step 2 instant block rules in priority order:
+     * Custom block rules -> Blocklist -> Adult keyword/pattern hit.
+     */
+    fun matchInstantBlock(rawDomain: String): BlockReason? {
+        val domain = normalizeDomainFast(rawDomain) ?: return null
+        val snapshot = snapshotRef.get()
+        if (matchesDomainOrParent(domain, snapshot.customBlocked)) {
+            return BlockReason.CUSTOM
+        }
+        if (matchesDomainOrParent(domain, snapshot.baseBlocked)) {
+            return BlockReason.BLOCKLIST
+        }
+        if (DomainUtils.containsAdultKeyword(domain)) {
+            return BlockReason.KEYWORD
+        }
+        return null
+    }
+
+    /**
+     * Checks if [rawDomain] is allowed by whitelist/safe-list or blocked by instant rules.
      */
     fun isBlocked(rawDomain: String): Boolean {
         val domain = normalizeDomainFast(rawDomain) ?: return false
-        val snapshot = snapshotRef.get()
+        if (isAlwaysAllowedInternalHost(domain)) return false
+        if (isWhitelisted(domain) || isSafeListed(domain)) return false
+        return matchInstantBlock(domain) != null
+    }
 
-        if (matchesDomainOrParent(domain, snapshot.whitelist)) {
-            return false
+    private fun loadDomainSetFromAsset(context: Context, assetName: String): HashSet<String> {
+        val loaded = HashSet<String>(256)
+        runCatching {
+            context.assets.open(assetName).bufferedReader().useLines { lines ->
+                lines.forEach { rawLine ->
+                    parseBlocklistLine(rawLine)?.let { domain -> loaded.add(domain) }
+                }
+            }
         }
-        return matchesDomainOrParent(domain, snapshot.baseBlocked) ||
-            matchesDomainOrParent(domain, snapshot.customBlocked)
+        return loaded
     }
 
     private fun matchesDomainOrParent(domain: String, set: HashSet<String>): Boolean {
@@ -87,10 +158,6 @@ class DomainFilterEngine {
     companion object {
         const val SELF_TEST_DOMAIN = "blocktest.dnsshield.test"
 
-        /**
-         * Parses either a plain domain line (`example.com`) or a hosts-file line
-         * (`0.0.0.0 example.com` / `127.0.0.1 example.com`).
-         */
         fun parseBlocklistLine(rawLine: String): String? {
             val noComment = rawLine.substringBefore('#').trim()
             if (noComment.isEmpty()) return null
@@ -113,20 +180,18 @@ class DomainFilterEngine {
             var cleaned = input.trim().lowercase(Locale.ROOT)
             if (cleaned.isEmpty()) return null
 
-            // Strip URL scheme and path if user pasted a full URL
             val schemeIdx = cleaned.indexOf("://")
             if (schemeIdx >= 0) {
                 cleaned = cleaned.substring(schemeIdx + 3)
             }
             cleaned = cleaned.substringBefore('/').substringBefore('?').substringBefore('#')
-            cleaned = cleaned.substringBefore(':') // strip port if any
+            cleaned = cleaned.substringBefore(':')
             cleaned = cleaned.trim().trimEnd('.')
 
             if (cleaned.isEmpty() || cleaned.length > 253) return null
             if (cleaned == "localhost" || cleaned == "localhost.localdomain") return null
             if (!cleaned.contains('.')) return null
 
-            // Validate characters (letters, digits, hyphens, dots)
             for (ch in cleaned) {
                 val valid =
                     (ch in 'a'..'z') || (ch in '0'..'9') || ch == '-' || ch == '.' || ch == '_'

@@ -165,4 +165,75 @@ object DnsWireCodec {
 
         return response
     }
+
+    /**
+     * Checks whether a DNS wire response contains an A (0.0.0.0) or AAAA (::) answer record,
+     * which Cloudflare Family DNS (1.1.1.3) returns for blocked adult domains.
+     */
+    fun isZeroIpAnswer(packet: ByteArray, length: Int = packet.size): Boolean {
+        if (length < DNS_HEADER_SIZE) return false
+        val flags = ((packet[2].toInt() and 0xFF) shl 8) or (packet[3].toInt() and 0xFF)
+        if ((flags and 0x8000) == 0) return false // Not a response
+
+        val qdCount = ((packet[4].toInt() and 0xFF) shl 8) or (packet[5].toInt() and 0xFF)
+        val anCount = ((packet[6].toInt() and 0xFF) shl 8) or (packet[7].toInt() and 0xFF)
+        if (anCount <= 0) return false
+
+        var pos = DNS_HEADER_SIZE
+        for (q in 0 until qdCount) {
+            pos = skipDnsName(packet, pos, length)
+            if (pos < 0 || pos + 4 > length) return false
+            pos += 4 // QTYPE + QCLASS
+        }
+
+        for (a in 0 until anCount) {
+            pos = skipDnsName(packet, pos, length)
+            if (pos < 0 || pos + 10 > length) return false
+            val rrType = ((packet[pos].toInt() and 0xFF) shl 8) or (packet[pos + 1].toInt() and 0xFF)
+            val rdLength =
+                ((packet[pos + 8].toInt() and 0xFF) shl 8) or (packet[pos + 9].toInt() and 0xFF)
+            pos += 10
+            if (pos + rdLength > length) return false
+
+            if (rrType == QTYPE_A && rdLength == 4) {
+                if (
+                    packet[pos] == 0.toByte() &&
+                        packet[pos + 1] == 0.toByte() &&
+                        packet[pos + 2] == 0.toByte() &&
+                        packet[pos + 3] == 0.toByte()
+                ) {
+                    return true
+                }
+            } else if (rrType == QTYPE_AAAA && rdLength == 16) {
+                var allZero = true
+                for (i in 0 until 16) {
+                    if (packet[pos + i] != 0.toByte()) {
+                        allZero = false
+                        break
+                    }
+                }
+                if (allZero) return true
+            }
+            pos += rdLength
+        }
+        return false
+    }
+
+    private fun skipDnsName(packet: ByteArray, startPos: Int, length: Int): Int {
+        var pos = startPos
+        var steps = 0
+        while (pos < length && steps < 128) {
+            val len = packet[pos].toInt() and 0xFF
+            if (len == 0) {
+                return pos + 1
+            }
+            if ((len and 0xC0) == 0xC0) {
+                return if (pos + 2 <= length) pos + 2 else -1
+            }
+            if ((len and 0xC0) != 0) return -1
+            pos += 1 + len
+            steps++
+        }
+        return -1
+    }
 }

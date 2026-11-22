@@ -52,6 +52,18 @@
     <string name="battery_restricted">Optimized (May pause shield)</string>
     <string name="disable_battery_opt">Disable</string>
     <string name="auto_start_note">Auto-starts on boot when enabled</string>
+    <string name="ai_verification_title">AI verification</string>
+    <string name="gemini_api_key_label">Gemini API Key</string>
+    <string name="gemini_api_key_hint">Paste your Gemini API key</string>
+    <string name="gemini_model_label">Model name</string>
+    <string name="save_button">Save</string>
+    <string name="when_unsure_label">When unsure</string>
+    <string name="when_unsure_allow">Allow</string>
+    <string name="when_unsure_block">Block</string>
+    <string name="test_ai_connection">Test AI connection</string>
+    <string name="check_domain_title">Check a domain</string>
+    <string name="check_domain_hint">Enter domain to inspect…</string>
+    <string name="check_domain_button">Check</string>
 
     <!-- Onboarding -->
     <string name="onboarding_title">Welcome to DNS Shield</string>

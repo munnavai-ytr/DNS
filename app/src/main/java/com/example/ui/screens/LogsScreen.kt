@@ -46,7 +46,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.local.BlockedLogEntity
+import com.example.ui.theme.ShieldAmber
 import com.example.ui.theme.ShieldCoral
+import com.example.ui.theme.ShieldCyan
 import com.example.ui.theme.ShieldEmerald
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -65,7 +67,12 @@ fun LogsScreen(
     val filteredLogs =
         remember(logs, searchQuery) {
             val q = searchQuery.trim().lowercase(Locale.ROOT)
-            if (q.isEmpty()) logs else logs.filter { it.domain.contains(q) }
+            if (q.isEmpty()) logs
+            else {
+                logs.filter {
+                    it.domain.contains(q) || it.reason.lowercase(Locale.ROOT).contains(q)
+                }
+            }
         }
 
     val timeFormatter = remember { SimpleDateFormat("MMM d, HH:mm:ss", Locale.getDefault()) }
@@ -218,6 +225,13 @@ private fun BlockedLogRow(
     formattedTime: String,
     onWhitelist: () -> Unit,
 ) {
+    val reasonTint =
+        when (entry.reason) {
+            "AI" -> ShieldCyan
+            "Keyword", "Upstream filter" -> ShieldAmber
+            else -> ShieldCoral
+        }
+
     Card(
         modifier = Modifier.fillMaxWidth().testTag("log_item_${entry.id}"),
         shape = RoundedCornerShape(14.dp),
@@ -231,7 +245,7 @@ private fun BlockedLogRow(
         ) {
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
                 Text(
                     text = entry.domain,
@@ -243,7 +257,7 @@ private fun BlockedLogRow(
                 )
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     Surface(
                         shape = RoundedCornerShape(6.dp),
@@ -256,12 +270,26 @@ private fun BlockedLogRow(
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                         )
                     }
-                    Text(
-                        text = formattedTime,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = reasonTint.copy(alpha = 0.14f),
+                        border = BorderStroke(0.5.dp, reasonTint.copy(alpha = 0.4f)),
+                    ) {
+                        Text(
+                            text =
+                                if (entry.durationMs > 0) "${entry.reason} • ${entry.durationMs} ms"
+                                else entry.reason,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = reasonTint,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
                 }
+                Text(
+                    text = formattedTime,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             IconButton(

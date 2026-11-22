@@ -19,10 +19,12 @@ import com.example.DnsShieldApplication
 import com.example.MainActivity
 import com.example.R
 import com.example.data.repository.ShieldRepository
+import com.example.dns.DnsDecision
 import com.example.dns.DnsWireCodec
 import com.example.dns.IpUdpPacketCodec
 import com.example.dns.ParsedUdpPacket
 import com.example.dns.UpstreamDnsForwarder
+import com.example.dns.UpstreamDnsResult
 import com.example.receiver.ServiceRestartReceiver
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -89,7 +91,6 @@ class DnsVpnService : VpnService() {
         startForegroundNotification()
 
         if (action == null) {
-            // Sticky restart by system: verify user still wants VPN enabled
             serviceScope.launch {
                 val shouldRun = repository.isVpnDesiredEnabled()
                 if (!shouldRun || prepare(this@DnsVpnService) != null) {
@@ -144,7 +145,6 @@ class DnsVpnService : VpnService() {
                 .addDnsServer(VPN_DNS_V4)
                 .addRoute(VPN_DNS_V4, 32)
 
-        // Also intercept IPv6 DNS if kernel supports IPv6 TUN routing
         runCatching {
             builder
                 .addAddress(VPN_ADDRESS_V6, 128)
@@ -200,29 +200,86 @@ class DnsVpnService : VpnService() {
         val payload = udpPacket.payload
         val query = DnsWireCodec.parseQuery(payload, payload.size) ?: return
 
-        if (repository.filterEngine.isBlocked(query.domain)) {
-            // Immediate synthetic response (< 1ms) before async DB/DataStore logging
-            val dnsResponse = DnsWireCodec.buildBlockedResponse(payload, query)
-            val ipResponse = IpUdpPacketCodec.buildUdpResponsePacket(udpPacket, dnsResponse)
-            writePacketToTun(ipResponse)
-
+        // Internal Gemini API host always forwards immediately without semaphore or holding
+        if (repository.filterEngine.isAlwaysAllowedInternalHost(query.domain)) {
             serviceScope.launch {
-                runCatching { repository.recordBlockedQuery(query.domain, query.qtypeLabel) }
-            }
-            return
-        }
-
-        serviceScope.launch {
-            upstreamSemaphore.withPermit {
                 try {
-                    val upstreamReply = upstreamForwarder.forward(payload) ?: return@withPermit
+                    val upstreamReply = upstreamForwarder.forward(payload) ?: return@launch
                     val ipResponse = IpUdpPacketCodec.buildUdpResponsePacket(udpPacket, upstreamReply)
                     writePacketToTun(ipResponse)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Throwable) {
-                    // Drop silently without crashing
                 }
+            }
+            return
+        }
+
+        // Fast synchronous path (< 10 ms) for blocklist, custom rules, keywords, and cached ADULT
+        val instant = repository.decisionEngine.checkInstantDecision(query.domain)
+        if (instant is DnsDecision.Block) {
+            val dnsResponse = DnsWireCodec.buildBlockedResponse(payload, query)
+            val ipResponse = IpUdpPacketCodec.buildUdpResponsePacket(udpPacket, dnsResponse)
+            writePacketToTun(ipResponse)
+
+            serviceScope.launch {
+                runCatching {
+                    repository.recordBlockedQuery(
+                        domain = query.domain,
+                        queryType = query.qtypeLabel,
+                        reason = instant.reason,
+                        durationMs = instant.latencyMs,
+                    )
+                }
+            }
+            return
+        }
+
+        // Asynchronous decision path (Whitelist, Safe list, Cache SAFE, Upstream 1.1.1.3, AI)
+        serviceScope.launch {
+            try {
+                val decision =
+                    repository.decisionEngine.evaluate(query.domain) {
+                        val reply =
+                            upstreamSemaphore.withPermit { upstreamForwarder.forward(payload) }
+                        val blockedByUpstream =
+                            reply != null && DnsWireCodec.isZeroIpAnswer(reply, reply.size)
+                        UpstreamDnsResult(reply, blockedByUpstream)
+                    }
+
+                when (decision) {
+                    is DnsDecision.Block -> {
+                        val dnsResponse = DnsWireCodec.buildBlockedResponse(payload, query)
+                        val ipResponse =
+                            IpUdpPacketCodec.buildUdpResponsePacket(udpPacket, dnsResponse)
+                        writePacketToTun(ipResponse)
+                        runCatching {
+                            repository.recordBlockedQuery(
+                                domain = query.domain,
+                                queryType = query.qtypeLabel,
+                                reason = decision.reason,
+                                durationMs = decision.latencyMs,
+                            )
+                        }
+                    }
+                    is DnsDecision.AllowWithUpstream -> {
+                        val ipResponse =
+                            IpUdpPacketCodec.buildUdpResponsePacket(udpPacket, decision.upstreamBytes)
+                        writePacketToTun(ipResponse)
+                    }
+                    is DnsDecision.AllowImmediate -> {
+                        val reply = upstreamSemaphore.withPermit { upstreamForwarder.forward(payload) }
+                        if (reply != null) {
+                            val ipResponse = IpUdpPacketCodec.buildUdpResponsePacket(udpPacket, reply)
+                            writePacketToTun(ipResponse)
+                        }
+                    }
+                    is DnsDecision.Drop -> Unit
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // Drop silently without crashing
             }
         }
     }
