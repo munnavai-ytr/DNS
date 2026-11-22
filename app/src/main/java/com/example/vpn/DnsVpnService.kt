@@ -25,9 +25,11 @@ import com.example.dns.IpUdpPacketCodec
 import com.example.dns.ParsedUdpPacket
 import com.example.dns.UpstreamDnsForwarder
 import com.example.dns.UpstreamDnsResult
+import com.example.protection.ProtectionWatchdogReceiver
 import com.example.receiver.ServiceRestartReceiver
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.lang.ref.WeakReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,9 +58,11 @@ class DnsVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = WeakReference(this)
         repository = (application as DnsShieldApplication).repository
         upstreamForwarder = UpstreamDnsForwarder { socket -> protect(socket) }
         createNotificationChannel()
+        publishVpnSecurityFlags()
 
         serviceScope.launch {
             repository.statsSnapshot
@@ -75,16 +79,31 @@ class DnsVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        publishVpnSecurityFlags()
         val action = intent?.action
         if (action == ACTION_STOP) {
-            userStoppedExplicitly = true
             serviceScope.launch {
-                repository.setVpnDesiredEnabled(false)
-                stopVpnTunnel()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                val guardActive = repository.isGuardBlockingNow()
+                if (guardActive) {
+                    // Reject disable requests while Tamper Protection is ON and locked
+                    userStoppedExplicitly = false
+                    startForegroundNotification()
+                    startVpnTunnelIfNeeded()
+                } else {
+                    userStoppedExplicitly = true
+                    repository.setVpnDesiredEnabled(false)
+                    stopVpnTunnel()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
-            return START_NOT_STICKY
+            return START_STICKY
+        }
+
+        if (action == ACTION_REFRESH_NOTIFICATION) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.notify(NOTIFICATION_ID, buildNotification(latestBlockedToday))
+            return START_STICKY
         }
 
         userStoppedExplicitly = false
@@ -92,7 +111,8 @@ class DnsVpnService : VpnService() {
 
         if (action == null) {
             serviceScope.launch {
-                val shouldRun = repository.isVpnDesiredEnabled()
+                val guardActive = repository.isGuardBlockingNow()
+                val shouldRun = guardActive || repository.isVpnDesiredEnabled()
                 if (!shouldRun || prepare(this@DnsVpnService) != null) {
                     stopVpnTunnel()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -104,10 +124,13 @@ class DnsVpnService : VpnService() {
         } else {
             serviceScope.launch {
                 if (prepare(this@DnsVpnService) != null) {
-                    repository.setVpnDesiredEnabled(false)
+                    if (!repository.isGuardBlockingNow()) {
+                        repository.setVpnDesiredEnabled(false)
+                    }
                     stopVpnTunnel()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
+                    ProtectionWatchdogReceiver.triggerAudit(applicationContext)
                 } else {
                     repository.setVpnDesiredEnabled(true)
                     startVpnTunnelIfNeeded()
@@ -116,6 +139,16 @@ class DnsVpnService : VpnService() {
         }
 
         return START_STICKY
+    }
+
+    private fun publishVpnSecurityFlags() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val alwaysOn = runCatching { isAlwaysOn }.getOrDefault(false)
+            val lockdown = runCatching { isLockdownEnabled }.getOrDefault(false)
+            repository.updateVpnSecurityFlags(alwaysOn = alwaysOn, lockdownEnabled = lockdown)
+        } else {
+            repository.updateVpnSecurityFlags(alwaysOn = false, lockdownEnabled = false)
+        }
     }
 
     private fun startForegroundNotification() {
@@ -130,6 +163,7 @@ class DnsVpnService : VpnService() {
     }
 
     private suspend fun startVpnTunnelIfNeeded() {
+        publishVpnSecurityFlags()
         if (vpnInterface != null && packetLoopJob?.isActive == true) {
             repository.updateVpnRunning(true)
             return
@@ -155,7 +189,12 @@ class DnsVpnService : VpnService() {
         val established = runCatching { builder.establish() }.getOrNull()
         if (established == null) {
             repository.updateVpnRunning(false)
-            repository.setVpnDesiredEnabled(false)
+            if (!repository.isGuardBlockingNowSync()) {
+                repository.setVpnDesiredEnabled(false)
+            } else {
+                scheduleRestartIfNeeded()
+                ProtectionWatchdogReceiver.triggerAudit(applicationContext)
+            }
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -307,29 +346,43 @@ class DnsVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        userStoppedExplicitly = true
-        serviceScope.launch {
-            repository.setVpnDesiredEnabled(false)
+        val guardActive = repository.isGuardBlockingNowSync()
+        if (guardActive) {
+            userStoppedExplicitly = false
             stopVpnTunnel()
+            scheduleRestartIfNeeded()
+            ProtectionWatchdogReceiver.triggerAudit(applicationContext)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
+        } else {
+            userStoppedExplicitly = true
+            serviceScope.launch {
+                repository.setVpnDesiredEnabled(false)
+                stopVpnTunnel()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
         super.onRevoke()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        if (!userStoppedExplicitly) {
+        if (!userStoppedExplicitly || repository.isGuardBlockingNowSync()) {
             scheduleRestartIfNeeded()
         }
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
-        val shouldRestart = !userStoppedExplicitly
+        if (activeInstance?.get() === this) {
+            activeInstance = null
+        }
+        val shouldRestart = !userStoppedExplicitly || repository.isGuardBlockingNowSync()
         stopVpnTunnel()
         serviceScope.cancel()
         if (shouldRestart) {
             scheduleRestartIfNeeded()
+            ProtectionWatchdogReceiver.triggerAudit(applicationContext)
         }
         super.onDestroy()
     }
@@ -379,34 +432,47 @@ class DnsVpnService : VpnService() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
 
-        val stopIntent =
-            PendingIntent.getService(
-                this,
-                1,
-                Intent(this, DnsVpnService::class.java).apply { action = ACTION_STOP },
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
+        val guardActive = repository.isGuardBlockingNowSync()
+        val contentText =
+            if (guardActive) {
+                "Tamper Guard ON • $blockedToday blocked today"
+            } else {
+                "Filtering DNS • $blockedToday blocked today"
+            }
 
-        val contentText = "Filtering DNS • $blockedToday blocked today"
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_shield_notification)
-            .setContentTitle(getString(R.string.notification_title))
-            .setContentText(contentText)
-            .setOngoing(true)
-            .setSilent(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setContentIntent(openAppIntent)
-            .addAction(
+        val builder =
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_shield_notification)
+                .setContentTitle(getString(R.string.notification_title))
+                .setContentText(contentText)
+                .setOngoing(true)
+                .setSilent(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setContentIntent(openAppIntent)
+
+        // When Tamper Protection is ON (and outside an unlock window), do NOT show a disable action
+        if (!guardActive) {
+            val stopIntent =
+                PendingIntent.getService(
+                    this,
+                    1,
+                    Intent(this, DnsVpnService::class.java).apply { action = ACTION_STOP },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
+            builder.addAction(
                 R.drawable.ic_shield_notification,
                 getString(R.string.notification_stop),
                 stopIntent,
             )
-            .build()
+        }
+
+        return builder.build()
     }
 
     companion object {
         const val ACTION_START = "com.example.action.START_VPN"
         const val ACTION_STOP = "com.example.action.STOP_VPN"
+        const val ACTION_REFRESH_NOTIFICATION = "com.example.action.REFRESH_VPN_NOTIFICATION"
 
         private const val CHANNEL_ID = "dns_shield_vpn_channel"
         private const val NOTIFICATION_ID = 1001
@@ -420,6 +486,18 @@ class DnsVpnService : VpnService() {
         private const val VPN_DNS_V4 = "10.111.222.2"
         private const val VPN_ADDRESS_V6 = "fd11:1111:1111::1"
         private const val VPN_DNS_V6 = "fd11:1111:1111::2"
+
+        @Volatile private var activeInstance: WeakReference<DnsVpnService>? = null
+
+        fun refreshFlagsIfRunning() {
+            activeInstance?.get()?.publishVpnSecurityFlags()
+        }
+
+        fun refreshNotificationIfRunning(context: Context) {
+            val instance = activeInstance?.get() ?: return
+            val manager = context.getSystemService(NotificationManager::class.java) ?: return
+            manager.notify(NOTIFICATION_ID, instance.buildNotification(instance.latestBlockedToday))
+        }
 
         fun start(context: Context) {
             val intent = Intent(context, DnsVpnService::class.java).apply { action = ACTION_START }

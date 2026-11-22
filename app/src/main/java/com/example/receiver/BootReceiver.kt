@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import com.example.DnsShieldApplication
+import com.example.protection.ProtectionWatchdogScheduler
 import com.example.vpn.DnsVpnService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,7 +31,10 @@ class BootReceiver : BroadcastReceiver() {
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val shouldStart = app.repository.isVpnDesiredEnabled()
+                ProtectionWatchdogScheduler.ensurePeriodicWatchdog(context)
+                val snapshot = app.repository.refreshProtectionState(restartVpnIfProtectedAndDown = false)
+                val shouldStart =
+                    snapshot.tamperState.isGuardActive || app.repository.isVpnDesiredEnabled()
                 if (shouldStart && VpnService.prepare(context) == null) {
                     DnsVpnService.start(context)
                 }

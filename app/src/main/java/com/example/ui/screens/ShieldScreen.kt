@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GppBad
 import androidx.compose.material.icons.filled.GppGood
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Shield
@@ -48,6 +49,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -67,6 +69,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.protection.ProtectionLevel
+import com.example.protection.ProtectionNotificationHelper
 import com.example.ui.theme.ShieldAmber
 import com.example.ui.theme.ShieldCoral
 import com.example.ui.theme.ShieldEmerald
@@ -78,6 +82,10 @@ fun ShieldScreen(
     uiState: MainUiState,
     onToggleVpn: () -> Unit,
     onRunSelfTest: () -> Unit,
+    onOpenProtectionChecklist: () -> Unit,
+    onOpenUnlockFlow: () -> Unit,
+    onCancelTurnOffRequest: () -> Unit,
+    onLockAgain: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val isActive = uiState.isVpnRunning
@@ -164,6 +172,15 @@ fun ShieldScreen(
                     modifier = Modifier.weight(1f),
                 )
             }
+
+            // Tamper Protection Card (V3)
+            ProtectionStatusCard(
+                uiState = uiState,
+                onOpenChecklist = onOpenProtectionChecklist,
+                onOpenUnlockFlow = onOpenUnlockFlow,
+                onCancelTurnOffRequest = onCancelTurnOffRequest,
+                onLockAgain = onLockAgain,
+            )
 
             // Self Test Card
             SelfTestCard(
@@ -537,3 +554,164 @@ private fun SelfTestCard(
         }
     }
 }
+
+@Composable
+private fun ProtectionStatusCard(
+    uiState: MainUiState,
+    onOpenChecklist: () -> Unit,
+    onOpenUnlockFlow: () -> Unit,
+    onCancelTurnOffRequest: () -> Unit,
+    onLockAgain: () -> Unit,
+) {
+    val tamper = uiState.tamperState
+    val level = uiState.protectionLevel
+    val accent =
+        when (level) {
+            ProtectionLevel.ON -> ShieldEmerald
+            ProtectionLevel.WEAK -> ShieldCoral
+            ProtectionLevel.OFF -> ShieldAmber
+        }
+
+    Card(
+        modifier = Modifier.fillMaxWidth().testTag("protection_status_card"),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Lock,
+                        contentDescription = null,
+                        tint = accent,
+                    )
+                    Text(
+                        text = stringResource(R.string.protection_card_title),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+                ProtectionLevelBadge(level = level)
+            }
+
+            val summaryText =
+                when {
+                    tamper.isUnlockWindowActive -> {
+                        val rem =
+                            ProtectionNotificationHelper.formatDurationShort(
+                                tamper.unlockWindowRemainingMs
+                            )
+                        "15-minute unlock window active ($rem remaining)."
+                    }
+                    tamper.isCountdownReadyToUnlock ->
+                        "Cooling-off countdown finished. Enter PIN to unlock."
+                    tamper.isCountdownActive -> {
+                        val rem =
+                            ProtectionNotificationHelper.formatDurationShort(
+                                tamper.countdownRemainingMs
+                            )
+                        "Turn-off countdown active: $rem remaining."
+                    }
+                    level == ProtectionLevel.ON ->
+                        "Tamper Guard ON • Wait time: ${tamper.waitDuration.label}"
+                    level == ProtectionLevel.WEAK ->
+                        "Protection weakened. One or more required guards are disabled."
+                    else ->
+                        "Complete PIN, Wait Time, Device Admin, and Accessibility Guard to turn ON."
+                }
+
+            Text(
+                text = summaryText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onOpenChecklist,
+                    modifier =
+                        Modifier.weight(1f)
+                            .height(48.dp)
+                            .testTag("protection_checklist_button"),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text(
+                        text =
+                            if (level == ProtectionLevel.WEAK) "Fix Weakened"
+                            else if (!tamper.protectionSetupDone) "Set Up"
+                            else "Checklist",
+                        maxLines = 1,
+                    )
+                }
+
+                when {
+                    tamper.isUnlockWindowActive -> {
+                        Button(
+                            onClick = onLockAgain,
+                            modifier =
+                                Modifier.weight(1f)
+                                    .height(48.dp)
+                                    .testTag("protection_lock_again_button"),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Text(stringResource(R.string.lock_again_button), maxLines = 1)
+                        }
+                    }
+                    tamper.isCountdownActive -> {
+                        OutlinedButton(
+                            onClick = onCancelTurnOffRequest,
+                            modifier =
+                                Modifier.weight(1f)
+                                    .height(48.dp)
+                                    .testTag("protection_cancel_request_button"),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, ShieldCoral.copy(alpha = 0.6f)),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = ShieldCoral),
+                        ) {
+                            Text(stringResource(R.string.cancel_request_button), maxLines = 1)
+                        }
+                    }
+                    tamper.isCountdownReadyToUnlock -> {
+                        Button(
+                            onClick = onOpenUnlockFlow,
+                            modifier =
+                                Modifier.weight(1f)
+                                    .height(48.dp)
+                                    .testTag("protection_enter_pin_unlock_button"),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Text("Enter PIN", maxLines = 1)
+                        }
+                    }
+                    tamper.protectionSetupDone -> {
+                        OutlinedButton(
+                            onClick = onOpenUnlockFlow,
+                            modifier =
+                                Modifier.weight(1f)
+                                    .height(48.dp)
+                                    .testTag("protection_request_turn_off_button"),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Text("Turn Off", maxLines = 1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import android.content.Context
+import android.os.SystemClock
 import com.example.data.local.BlockedLogEntity
 import com.example.data.local.CustomRuleEntity
 import com.example.data.local.DnsShieldDatabase
@@ -15,6 +16,17 @@ import com.example.dns.DomainFilterEngine
 import com.example.dns.GeminiDomainClassifier
 import com.example.dns.UnsurePolicy
 import com.example.dns.VerdictCache
+import com.example.protection.PinActionResult
+import com.example.protection.ProtectionChecklistState
+import com.example.protection.ProtectionLevel
+import com.example.protection.ProtectionNotificationHelper
+import com.example.protection.ProtectionSystemChecker
+import com.example.protection.ProtectionWatchdogScheduler
+import com.example.protection.TamperProtectionEngine
+import com.example.protection.TamperProtectionState
+import com.example.protection.WaitDurationOption
+import com.example.protection.WaitTimeUpdateResult
+import com.example.vpn.DnsVpnService
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,6 +38,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
+data class ProtectionUiSnapshot(
+    val tamperState: TamperProtectionState = TamperProtectionState(),
+    val checklist: ProtectionChecklistState = ProtectionChecklistState(),
+    val protectionLevel: ProtectionLevel = ProtectionLevel.OFF,
+    val wizardPromptedAfterOnboarding: Boolean = false,
+)
+
 class ShieldRepository(
     context: Context,
     private val database: DnsShieldDatabase,
@@ -34,11 +53,18 @@ class ShieldRepository(
     val verdictCache: VerdictCache,
     private val classifier: GeminiDomainClassifier,
 ) {
+    private val appContext = context.applicationContext
     private val repoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val currentApiKeyRef = AtomicReference("")
     private val currentModelRef = AtomicReference(GeminiDomainClassifier.DEFAULT_MODEL)
     private val currentDecisionSettingsRef = AtomicReference(DecisionSettings())
+
+    val tamperEngine = TamperProtectionEngine(store = preferences)
+
+    // Fast volatile cache so AccessibilityService and DnsVpnService never block on disk I/O
+    @Volatile private var cachedProtectionActivated = false
+    @Volatile private var cachedUnlockEndElapsedMs = 0L
 
     val decisionEngine: DnsDecisionEngine =
         DnsDecisionEngine(
@@ -50,6 +76,12 @@ class ShieldRepository(
 
     private val _isVpnRunning = MutableStateFlow(false)
     val isVpnRunning: StateFlow<Boolean> = _isVpnRunning.asStateFlow()
+
+    private val _isVpnAlwaysOn = MutableStateFlow(false)
+    private val _isVpnLockdownEnabled = MutableStateFlow(false)
+
+    private val _protectionUiSnapshot = MutableStateFlow(ProtectionUiSnapshot())
+    val protectionUiSnapshot: StateFlow<ProtectionUiSnapshot> = _protectionUiSnapshot.asStateFlow()
 
     private val _baseRuleCount = MutableStateFlow(0)
     val baseRuleCount: StateFlow<Int> = _baseRuleCount.asStateFlow()
@@ -71,9 +103,11 @@ class ShieldRepository(
 
     init {
         repoScope.launch {
-            _baseRuleCount.value = filterEngine.loadBaseBlocklistFromAssets(context)
-            _safeRuleCount.value = filterEngine.loadSafeDomainsFromAssets(context)
+            _baseRuleCount.value = filterEngine.loadBaseBlocklistFromAssets(appContext)
+            _safeRuleCount.value = filterEngine.loadSafeDomainsFromAssets(appContext)
             verdictCache.loadFromDisk()
+            refreshProtectionState(restartVpnIfProtectedAndDown = false)
+            ProtectionWatchdogScheduler.ensurePeriodicWatchdog(appContext)
         }
         repoScope.launch {
             database.observeAllRules().collect { rules ->
@@ -101,6 +135,143 @@ class ShieldRepository(
 
     fun getCurrentModel(): String = currentModelRef.get()
 
+    fun isGuardBlockingNowSync(): Boolean {
+        if (!cachedProtectionActivated) return false
+        val unlockEnd = cachedUnlockEndElapsedMs
+        return unlockEnd == 0L || SystemClock.elapsedRealtime() >= unlockEnd
+    }
+
+    suspend fun isGuardBlockingNow(): Boolean {
+        val state = tamperEngine.getState()
+        updateFastGuardCache(state)
+        return state.isGuardActive
+    }
+
+    suspend fun refreshProtectionState(restartVpnIfProtectedAndDown: Boolean = false): ProtectionUiSnapshot {
+        DnsVpnService.refreshFlagsIfRunning()
+        val rawBeforeSync = tamperEngine.getRawState()
+        val checklistBefore = buildChecklist(rawBeforeSync.pinHashBase64.isNotBlank(), rawBeforeSync.waitDurationExplicitlyChosen || rawBeforeSync.protectionActivated)
+        val syncedState = tamperEngine.syncCoreProtectionActivation(checklistBefore.isCoreStepsComplete)
+        val rawAfterSync = tamperEngine.getRawState()
+
+        val checklist =
+            buildChecklist(
+                pinConfigured = syncedState.isPinConfigured,
+                waitConfigured =
+                    rawAfterSync.waitDurationExplicitlyChosen || syncedState.protectionSetupDone || syncedState.isPinConfigured,
+            )
+        val level = tamperEngine.computeProtectionLevel(checklist, syncedState)
+        val snapshot =
+            ProtectionUiSnapshot(
+                tamperState = syncedState,
+                checklist = checklist,
+                protectionLevel = level,
+                wizardPromptedAfterOnboarding = rawAfterSync.wizardPromptedAfterOnboarding,
+            )
+
+        updateFastGuardCache(syncedState)
+        _protectionUiSnapshot.value = snapshot
+
+        ProtectionNotificationHelper.syncTimerNotification(appContext, syncedState)
+        ProtectionNotificationHelper.syncWeakenedNotification(appContext, level, checklist)
+        ProtectionWatchdogScheduler.ensurePeriodicWatchdog(appContext)
+        ProtectionWatchdogScheduler.syncBoundaryTimer(appContext, syncedState)
+        DnsVpnService.refreshNotificationIfRunning(appContext)
+
+        if (
+            restartVpnIfProtectedAndDown &&
+                syncedState.isGuardActive &&
+                !checklist.vpnRunning &&
+                ProtectionSystemChecker.hasVpnPermission(appContext)
+        ) {
+            preferences.setVpnDesiredEnabled(true)
+            DnsVpnService.start(appContext)
+        }
+        return snapshot
+    }
+
+    private fun buildChecklist(
+        pinConfigured: Boolean,
+        waitConfigured: Boolean,
+    ): ProtectionChecklistState {
+        return ProtectionChecklistState(
+            pinConfigured = pinConfigured,
+            waitDurationConfigured = waitConfigured,
+            deviceAdminEnabled = ProtectionSystemChecker.isDeviceAdminActive(appContext),
+            accessibilityEnabled = ProtectionSystemChecker.isAccessibilityGuardEnabled(appContext),
+            vpnRunning = _isVpnRunning.value,
+            vpnAlwaysOn = _isVpnAlwaysOn.value,
+            vpnLockdownEnabled = _isVpnLockdownEnabled.value,
+            batteryOptimizationIgnored = ProtectionSystemChecker.isBatteryOptimizationIgnored(appContext),
+        )
+    }
+
+    private fun updateFastGuardCache(state: TamperProtectionState) {
+        cachedProtectionActivated = state.protectionSetupDone
+        cachedUnlockEndElapsedMs =
+            if (state.isUnlockWindowActive && state.unlockWindowRemainingMs > 0L) {
+                SystemClock.elapsedRealtime() + state.unlockWindowRemainingMs
+            } else {
+                0L
+            }
+    }
+
+    suspend fun markWizardPromptedAfterOnboarding() {
+        tamperEngine.markWizardPromptedAfterOnboarding()
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+    }
+
+    suspend fun setInitialPin(pin: String): PinActionResult {
+        val result = tamperEngine.setInitialPin(pin)
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return result
+    }
+
+    suspend fun changePin(currentPin: String, newPin: String): PinActionResult {
+        val result = tamperEngine.changePin(currentPin, newPin)
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return result
+    }
+
+    suspend fun setWaitDuration(option: WaitDurationOption): WaitTimeUpdateResult {
+        val result = tamperEngine.setWaitDuration(option)
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return result
+    }
+
+    suspend fun confirmWaitDurationSelection() {
+        tamperEngine.confirmWaitDurationSelection()
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+    }
+
+    suspend fun requestTurnOffProtection(pin: String): PinActionResult {
+        val result = tamperEngine.requestTurnOffProtection(pin)
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return result
+    }
+
+    suspend fun confirmUnlockWindow(pin: String): PinActionResult {
+        val result = tamperEngine.confirmUnlockWindow(pin)
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return result
+    }
+
+    suspend fun cancelTurnOffRequest() {
+        tamperEngine.cancelTurnOffRequest()
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+    }
+
+    suspend fun lockProtectionAgain() {
+        tamperEngine.lockAgainNow()
+        refreshProtectionState(restartVpnIfProtectedAndDown = true)
+    }
+
+    suspend fun deactivateProtectionInUnlockWindow(): Boolean {
+        val ok = tamperEngine.deactivateProtectionInUnlockWindow()
+        refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        return ok
+    }
+
     suspend fun ensureRulesLoaded(context: Context) {
         if (_baseRuleCount.value == 0) {
             _baseRuleCount.value = filterEngine.loadBaseBlocklistFromAssets(context)
@@ -116,7 +287,21 @@ class ShieldRepository(
     }
 
     fun updateVpnRunning(running: Boolean) {
+        val changed = _isVpnRunning.value != running
         _isVpnRunning.value = running
+        if (changed) {
+            repoScope.launch { refreshProtectionState(restartVpnIfProtectedAndDown = false) }
+        }
+    }
+
+    fun updateVpnSecurityFlags(alwaysOn: Boolean, lockdownEnabled: Boolean) {
+        val changed =
+            _isVpnAlwaysOn.value != alwaysOn || _isVpnLockdownEnabled.value != lockdownEnabled
+        _isVpnAlwaysOn.value = alwaysOn
+        _isVpnLockdownEnabled.value = lockdownEnabled
+        if (changed) {
+            repoScope.launch { refreshProtectionState(restartVpnIfProtectedAndDown = false) }
+        }
     }
 
     suspend fun setVpnDesiredEnabled(enabled: Boolean) {

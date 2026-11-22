@@ -30,6 +30,15 @@
     <string name="notification_channel_desc">Shows when local DNS filtering is active</string>
     <string name="notification_title">DNS Shield is Active</string>
     <string name="notification_stop">Turn Off</string>
+    <string name="notification_protection_channel_name">Tamper Protection Timer</string>
+    <string name="notification_protection_channel_desc">Shows cooling-off countdown or unlock window remaining time</string>
+    <string name="notification_alert_channel_name">Protection Alerts</string>
+    <string name="notification_alert_channel_desc">High-priority alerts if DNS Shield tamper protections are disabled</string>
+    <string name="notification_countdown_title">DNS Shield Turn-Off Countdown</string>
+    <string name="notification_countdown_ready_title">Cooling-off countdown complete</string>
+    <string name="notification_countdown_ready_desc">Tap to enter your PIN and open the 15-minute unlock window</string>
+    <string name="notification_unlock_title">DNS Shield Unlocked (15-min window)</string>
+    <string name="notification_weakened_title">Protection weakened, tap to fix</string>
 
     <!-- Logs Screen -->
     <string name="logs_title">Blocked Domains</string>
@@ -70,4 +79,18 @@
     <string name="onboarding_subtitle">Private, on-device adult site blocking across every app and browser.</string>
     <string name="onboarding_get_started">Activate &amp; Continue</string>
     <string name="onboarding_skip">Continue to App</string>
+
+    <!-- V3 Tamper Protection -->
+    <string name="accessibility_guard_label">DNS Shield Guard</string>
+    <string name="accessibility_guard_description">Prevents disabling DNS Shield, Device Admin, or uninstalling the app while Tamper Protection is ON.</string>
+    <string name="device_admin_label">DNS Shield Uninstall Guard</string>
+    <string name="device_admin_disable_warning">DNS Shield tamper protection is active. Disabling Device Admin weakens adult content protection.</string>
+    <string name="protected_by_dns_shield">Protected by DNS Shield</string>
+    <string name="protection_card_title">Protection</string>
+    <string name="protection_setup_title">Protection Setup</string>
+    <string name="protection_checklist_title">Protection Status Checklist</string>
+    <string name="request_turn_off_button">Request to turn off protection</string>
+    <string name="cancel_request_button">Cancel request</string>
+    <string name="lock_again_button">Lock again</string>
+    <string name="change_pin_button">Change PIN</string>
 </resources>

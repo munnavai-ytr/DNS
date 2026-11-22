@@ -7,8 +7,13 @@ A local, privacy-first Android DNS filter built with Kotlin, Jetpack Compose (Ma
 - **Instant Local Filtering**: Checks whitelists, ~150 built-in safe domains, blocklists, custom rules, adult keywords, and cached verdicts in `< 10 ms`.
 - **Cloudflare Family & AI Verification (V2)**: Unknown domains are checked against `1.1.1.3` (fallback `1.0.0.3`) and, when enabled with an API key, verified on-the-fly within 3 seconds via Gemini (`gemini-2.5-flash` by default). Only the domain name is sent.
 - **Persistent Verdict Cache**: Stores up to 5,000 verified registrable domains (`eTLD+1`) in an LRU cache (`SAFE` for 7 days, `ADULT` for 30 days).
-- **Blocked Log & Custom Rules**: Stores the last 200 blocked queries with block reason and latency, plus custom blocklist/whitelist overrides.
-- **Always-On Resilience**: Runs as a foreground service with a persistent notification, restarts if killed, and auto-starts on `BOOT_COMPLETED` when enabled.
+- **Tamper Protection (V3)**: Once Steps 1–4 are complete (6-digit PBKDF2-hashed PIN, cooling-off wait time, Device Admin, and Accessibility Guard), turning protection off requires entering the PIN, waiting out a clock-tamper-resistant cooling-off countdown, and entering the PIN again to open a 15-minute unlock window. Includes a 15-minute `JobScheduler` / `AlarmManager` watchdog and `"Protection weakened, tap to fix"` alerts.
+
+## Enabling Accessibility Guard on Sideloaded Android 13+ APKs
+Because sideloaded APKs restrict Accessibility toggles on Android 13+:
+1. In **DNS Shield → Protection Setup (Step 4)**, tap **Open App Info**.
+2. Tap the **three-dot menu (⋮)** in the top right corner and choose **Allow restricted settings**.
+3. Return to DNS Shield, tap **Accessibility Settings**, select **DNS Shield Guard**, and turn it **ON**.
 
 ## Getting a Gemini API Key (Optional V2 AI Verification)
 1. Visit **Google AI Studio** (`https://aistudio.google.com/apikey`) and sign in with your Google account.

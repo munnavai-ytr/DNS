@@ -5,6 +5,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -27,6 +29,7 @@ import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Policy
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Visibility
@@ -53,6 +56,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,6 +75,8 @@ import com.example.R
 import com.example.data.local.CustomRuleEntity
 import com.example.dns.DomainVerdict
 import com.example.dns.UnsurePolicy
+import com.example.protection.WaitDurationOption
+import com.example.protection.WaitTimeUpdateResult
 import com.example.ui.theme.ShieldAmber
 import com.example.ui.theme.ShieldCoral
 import com.example.ui.theme.ShieldCyan
@@ -78,6 +84,7 @@ import com.example.ui.theme.ShieldEmerald
 import com.example.ui.viewmodel.AiTestState
 import com.example.ui.viewmodel.DomainCheckState
 import com.example.ui.viewmodel.MainUiState
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
@@ -93,6 +100,11 @@ fun SettingsScreen(
     onAddWhitelist: (String) -> Unit,
     onRemoveRule: (String) -> Unit,
     onRequestBatteryOptimization: () -> Unit,
+    onOpenProtectionWizard: () -> Unit,
+    onOpenUnlockFlow: () -> Unit,
+    onOpenChangePin: () -> Unit,
+    onSelectWaitDuration: suspend (WaitDurationOption) -> WaitTimeUpdateResult,
+    onShowFeedback: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -111,6 +123,16 @@ fun SettingsScreen(
                 text = stringResource(R.string.settings_title),
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.onBackground,
+            )
+
+            // V3 Tamper Protection Card
+            TamperProtectionSettingsCard(
+                uiState = uiState,
+                onOpenProtectionWizard = onOpenProtectionWizard,
+                onOpenUnlockFlow = onOpenUnlockFlow,
+                onOpenChangePin = onOpenChangePin,
+                onSelectWaitDuration = onSelectWaitDuration,
+                onShowFeedback = onShowFeedback,
             )
 
             // AI Verification Card
@@ -772,3 +794,159 @@ private fun DomainRuleSectionCard(
         }
     }
 }
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TamperProtectionSettingsCard(
+    uiState: MainUiState,
+    onOpenProtectionWizard: () -> Unit,
+    onOpenUnlockFlow: () -> Unit,
+    onOpenChangePin: () -> Unit,
+    onSelectWaitDuration: suspend (WaitDurationOption) -> WaitTimeUpdateResult,
+    onShowFeedback: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val tamper = uiState.tamperState
+
+    Card(
+        modifier = Modifier.fillMaxWidth().testTag("settings_tamper_protection_card"),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Lock,
+                        contentDescription = null,
+                        tint = ShieldAmber,
+                    )
+                    Column {
+                        Text(
+                            text = "Tamper Protection",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "PIN lock, cooling-off timer, Device Admin & Guard",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                ProtectionLevelBadge(level = uiState.protectionLevel)
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = "Cooling-off wait time (raising allowed anytime; lowering only when unlocked)",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    WaitDurationOption.entries.forEach { option ->
+                        FilterChip(
+                            selected = tamper.waitDuration == option,
+                            onClick = {
+                                scope.launch {
+                                    when (val res = onSelectWaitDuration(option)) {
+                                        WaitTimeUpdateResult.Success ->
+                                            onShowFeedback("Wait time updated to ${option.label}")
+                                        is WaitTimeUpdateResult.Rejected ->
+                                            onShowFeedback(res.reason)
+                                    }
+                                }
+                            },
+                            label = { Text(option.label) },
+                            colors =
+                                FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = ShieldEmerald.copy(alpha = 0.2f),
+                                    selectedLabelColor = ShieldEmerald,
+                                ),
+                            modifier = Modifier.testTag("settings_wait_${option.name}"),
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onOpenProtectionWizard,
+                    modifier =
+                        Modifier.weight(1f)
+                            .height(48.dp)
+                            .testTag("settings_open_wizard_button"),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Text("Setup & Checklist", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+
+                if (tamper.isPinConfigured) {
+                    OutlinedButton(
+                        onClick = {
+                            if (tamper.protectionSetupDone && !tamper.isUnlockWindowActive) {
+                                onShowFeedback(
+                                    "PIN can only be changed during an active 15-minute unlock window."
+                                )
+                            } else {
+                                onOpenChangePin()
+                            }
+                        },
+                        modifier =
+                            Modifier.weight(1f)
+                                .height(48.dp)
+                                .testTag("settings_change_pin_button"),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text(stringResource(R.string.change_pin_button), maxLines = 1)
+                    }
+                }
+            }
+
+            if (tamper.protectionSetupDone || tamper.isUnlockWindowActive || tamper.isCountdownActive) {
+                Button(
+                    onClick = onOpenUnlockFlow,
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("settings_unlock_flow_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            containerColor = ShieldAmber.copy(alpha = 0.2f),
+                            contentColor = ShieldAmber,
+                        ),
+                ) {
+                    Text(
+                        text =
+                            when {
+                                tamper.isUnlockWindowActive -> "Unlock Window Active (Manage / Lock)"
+                                tamper.isCountdownActive -> "Countdown Active (View / Cancel)"
+                                tamper.isCountdownReadyToUnlock -> "Enter PIN to Open Unlock Window"
+                                else -> stringResource(R.string.request_turn_off_button)
+                            }
+                    )
+                }
+            }
+        }
+    }
+}
+

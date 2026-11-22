@@ -10,19 +10,29 @@ import com.example.DnsShieldApplication
 import com.example.data.local.BlockedLogEntity
 import com.example.data.local.CustomRuleEntity
 import com.example.data.local.ShieldStatsSnapshot
+import com.example.data.repository.ProtectionUiSnapshot
 import com.example.dns.DomainCheckSummary
 import com.example.dns.DomainFilterEngine
 import com.example.dns.DomainVerdict
 import com.example.dns.GeminiDomainClassifier
 import com.example.dns.UnsurePolicy
+import com.example.protection.PinActionResult
+import com.example.protection.ProtectionChecklistState
+import com.example.protection.ProtectionLevel
+import com.example.protection.ProtectionNotificationHelper
+import com.example.protection.TamperProtectionState
+import com.example.protection.WaitDurationOption
+import com.example.protection.WaitTimeUpdateResult
 import com.example.vpn.DnsVpnService
 import java.net.InetAddress
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -61,6 +71,7 @@ data class SystemPermissionState(
 data class MainUiState(
     val isReady: Boolean = false,
     val onboardingCompleted: Boolean = false,
+    val wizardPromptedAfterOnboarding: Boolean = false,
     val isVpnRunning: Boolean = false,
     val vpnDesiredEnabled: Boolean = false,
     val blockedToday: Long = 0L,
@@ -79,6 +90,9 @@ data class MainUiState(
     val aiTestState: AiTestState = AiTestState.Idle,
     val domainCheckState: DomainCheckState = DomainCheckState.Idle,
     val permissions: SystemPermissionState = SystemPermissionState(),
+    val tamperState: TamperProtectionState = TamperProtectionState(),
+    val checklistState: ProtectionChecklistState = ProtectionChecklistState(),
+    val protectionLevel: ProtectionLevel = ProtectionLevel.OFF,
     val ruleFeedbackMessage: String? = null,
 )
 
@@ -91,6 +105,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val domainCheckState = MutableStateFlow<DomainCheckState>(DomainCheckState.Idle)
     private val permissionState = MutableStateFlow(readSystemPermissions(application))
     private val ruleFeedback = MutableStateFlow<String?>(null)
+
+    init {
+        viewModelScope.launch {
+            var wasUnlockActive = false
+            while (isActive) {
+                val snap = repository.protectionUiSnapshot.value
+                val state = snap.tamperState
+                val hasActiveTimer =
+                    state.isCountdownActive || state.isUnlockWindowActive || state.isLockedOut
+                if (hasActiveTimer) {
+                    val updated =
+                        repository.refreshProtectionState(
+                            restartVpnIfProtectedAndDown = wasUnlockActive
+                        )
+                    wasUnlockActive = updated.tamperState.isUnlockWindowActive
+                } else {
+                    if (wasUnlockActive) {
+                        repository.refreshProtectionState(restartVpnIfProtectedAndDown = true)
+                    }
+                    wasUnlockActive = false
+                }
+                delay(1000L)
+            }
+        }
+    }
 
     private val baseStateFlow =
         combine(
@@ -114,26 +153,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             SecondarySlice(whitelist, selfTest, perms, feedback, cacheCount)
         }
 
-    private val v2ToolStateFlow =
+    private val v2AndV3SliceFlow =
         combine(
             repository.safeRuleCount,
             aiTestState,
             domainCheckState,
-        ) { safeCount, aiTest, domainCheck ->
-            V2ToolSlice(safeCount, aiTest, domainCheck)
+            repository.protectionUiSnapshot,
+        ) { safeCount, aiTest, domainCheck, protection ->
+            V2AndV3Slice(safeCount, aiTest, domainCheck, protection)
         }
 
     val uiState: StateFlow<MainUiState> =
-        combine(baseStateFlow, secondaryStateFlow, v2ToolStateFlow) { base, secondary, v2 ->
+        combine(baseStateFlow, secondaryStateFlow, v2AndV3SliceFlow) { base, secondary, extra ->
                 MainUiState(
                     isReady = true,
                     onboardingCompleted = base.stats.onboardingCompleted,
+                    wizardPromptedAfterOnboarding =
+                        base.stats.wizardPromptedAfterOnboarding ||
+                            extra.protection.wizardPromptedAfterOnboarding,
                     isVpnRunning = base.running,
                     vpnDesiredEnabled = base.stats.vpnDesiredEnabled,
                     blockedToday = base.stats.blockedToday,
                     totalBlocked = base.stats.totalBlocked,
                     baseRuleCount = base.baseCount,
-                    safeRuleCount = v2.safeCount,
+                    safeRuleCount = extra.safeCount,
                     cacheSize = secondary.cacheCount,
                     aiVerificationEnabled = base.stats.aiVerificationEnabled,
                     geminiApiKey = base.stats.geminiApiKey,
@@ -143,9 +186,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     customBlockedRules = base.customBlocked,
                     whitelistRules = secondary.whitelist,
                     selfTestState = secondary.selfTest,
-                    aiTestState = v2.aiTest,
-                    domainCheckState = v2.domainCheck,
+                    aiTestState = extra.aiTest,
+                    domainCheckState = extra.domainCheck,
                     permissions = secondary.perms,
+                    tamperState = extra.protection.tamperState,
+                    checklistState = extra.protection.checklist,
+                    protectionLevel = extra.protection.protectionLevel,
                     ruleFeedbackMessage = secondary.feedback,
                 )
             }
@@ -157,6 +203,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshSystemPermissions() {
         permissionState.value = readSystemPermissions(app)
+        viewModelScope.launch { repository.refreshProtectionState(restartVpnIfProtectedAndDown = false) }
     }
 
     fun startVpn() {
@@ -168,6 +215,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopVpn() {
         viewModelScope.launch {
+            if (repository.isGuardBlockingNow()) {
+                ruleFeedback.value =
+                    "Tamper protection is ON. Request to turn off protection first."
+                return@launch
+            }
             repository.setVpnDesiredEnabled(false)
             DnsVpnService.stop(app)
             selfTestState.value = SelfTestState.Idle
@@ -181,6 +233,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 repository.setVpnDesiredEnabled(true)
                 DnsVpnService.start(app)
             }
+            repository.refreshProtectionState(restartVpnIfProtectedAndDown = false)
+        }
+    }
+
+    fun markWizardPromptedAfterOnboarding() {
+        viewModelScope.launch { repository.markWizardPromptedAfterOnboarding() }
+    }
+
+    suspend fun setInitialPin(pin: String): PinActionResult {
+        return repository.setInitialPin(pin)
+    }
+
+    suspend fun changePin(currentPin: String, newPin: String): PinActionResult {
+        return repository.changePin(currentPin, newPin)
+    }
+
+    suspend fun selectWaitDuration(option: WaitDurationOption): WaitTimeUpdateResult {
+        return repository.setWaitDuration(option)
+    }
+
+    fun confirmWaitDurationStep() {
+        viewModelScope.launch { repository.confirmWaitDurationSelection() }
+    }
+
+    suspend fun requestTurnOffProtection(pin: String): PinActionResult {
+        return repository.requestTurnOffProtection(pin)
+    }
+
+    suspend fun confirmUnlockWindow(pin: String): PinActionResult {
+        return repository.confirmUnlockWindow(pin)
+    }
+
+    fun cancelTurnOffRequest() {
+        viewModelScope.launch {
+            repository.cancelTurnOffRequest()
+            ruleFeedback.value = "Turn-off request cancelled"
+        }
+    }
+
+    fun lockProtectionAgain() {
+        viewModelScope.launch {
+            repository.lockProtectionAgain()
+            ruleFeedback.value = "Tamper protection locked again"
+        }
+    }
+
+    fun deactivateProtectionInUnlockWindow() {
+        viewModelScope.launch {
+            val ok = repository.deactivateProtectionInUnlockWindow()
+            ruleFeedback.value =
+                if (ok) "Tamper protection turned OFF"
+                else "Unlock protection first to deactivate it"
+        }
+    }
+
+    fun formatActionError(result: PinActionResult): String? {
+        return when (result) {
+            PinActionResult.Success -> null
+            is PinActionResult.InvalidPin ->
+                "Incorrect PIN. ${result.attemptsRemaining} attempt(s) remaining before lockout."
+            is PinActionResult.LockedOut ->
+                "PIN locked for ${ProtectionNotificationHelper.formatDurationShort(result.remainingMs)}."
+            is PinActionResult.Rejected -> result.reason
         }
     }
 
@@ -319,6 +434,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.clearLogs() }
     }
 
+    fun showFeedback(message: String) {
+        ruleFeedback.value = message
+    }
+
     fun clearRuleFeedback() {
         ruleFeedback.value = null
     }
@@ -350,9 +469,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val cacheCount: Int,
     )
 
-    private data class V2ToolSlice(
+    private data class V2AndV3Slice(
         val safeCount: Int,
         val aiTest: AiTestState,
         val domainCheck: DomainCheckState,
+        val protection: ProtectionUiSnapshot,
     )
 }

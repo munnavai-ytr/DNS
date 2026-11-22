@@ -21,9 +21,12 @@ class ServiceRestartReceiver : BroadcastReceiver() {
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val shouldRun = app.repository.isVpnDesiredEnabled()
+                val guardActive = app.repository.isGuardBlockingNow()
+                val shouldRun = guardActive || app.repository.isVpnDesiredEnabled()
                 if (shouldRun && VpnService.prepare(context) == null) {
                     DnsVpnService.start(context)
+                } else {
+                    app.repository.refreshProtectionState(restartVpnIfProtectedAndDown = false)
                 }
             } catch (_: Throwable) {
                 // Ignore transient restart errors

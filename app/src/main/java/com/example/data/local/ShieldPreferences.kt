@@ -6,11 +6,15 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.dns.GeminiDomainClassifier
 import com.example.dns.UnsurePolicy
+import com.example.protection.PersistedTamperState
+import com.example.protection.ProtectionStateStore
+import com.example.protection.WaitDurationOption
 import java.io.IOException
 import java.time.LocalDate
 import kotlinx.coroutines.flow.Flow
@@ -30,9 +34,10 @@ data class ShieldStatsSnapshot(
     val geminiApiKey: String = "",
     val geminiModel: String = GeminiDomainClassifier.DEFAULT_MODEL,
     val whenUnsure: UnsurePolicy = UnsurePolicy.ALLOW,
+    val wizardPromptedAfterOnboarding: Boolean = false,
 )
 
-class ShieldPreferences(private val context: Context) {
+class ShieldPreferences(private val context: Context) : ProtectionStateStore {
     private object Keys {
         val ONBOARDING_COMPLETED = booleanPreferencesKey("onboarding_completed")
         val VPN_DESIRED_ENABLED = booleanPreferencesKey("vpn_desired_enabled")
@@ -43,6 +48,26 @@ class ShieldPreferences(private val context: Context) {
         val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
         val GEMINI_MODEL = stringPreferencesKey("gemini_model")
         val WHEN_UNSURE = stringPreferencesKey("when_unsure")
+
+        // V3 Tamper Protection keys
+        val PIN_SALT_BASE64 = stringPreferencesKey("tamper_pin_salt")
+        val PIN_HASH_BASE64 = stringPreferencesKey("tamper_pin_hash")
+        val WAIT_DURATION_MS = longPreferencesKey("tamper_wait_duration_ms")
+        val WAIT_DURATION_CHOSEN = booleanPreferencesKey("tamper_wait_duration_chosen")
+        val PROTECTION_ACTIVATED = booleanPreferencesKey("tamper_protection_activated")
+        val WIZARD_PROMPTED_AFTER_ONBOARDING =
+            booleanPreferencesKey("tamper_wizard_prompted_after_onboarding")
+        val HIGHEST_WALL_CLOCK_MS = longPreferencesKey("tamper_highest_wall_clock_ms")
+        val LAST_ELAPSED_REALTIME_MS = longPreferencesKey("tamper_last_elapsed_realtime_ms")
+        val COUNTDOWN_ACTIVE = booleanPreferencesKey("tamper_countdown_active")
+        val COUNTDOWN_REMAINING_MS = longPreferencesKey("tamper_countdown_remaining_ms")
+        val COUNTDOWN_READY_FOR_SECOND_PIN =
+            booleanPreferencesKey("tamper_countdown_ready_for_second_pin")
+        val UNLOCK_WINDOW_ACTIVE = booleanPreferencesKey("tamper_unlock_window_active")
+        val UNLOCK_WINDOW_REMAINING_MS = longPreferencesKey("tamper_unlock_window_remaining_ms")
+        val FAILED_PIN_ATTEMPTS = intPreferencesKey("tamper_failed_pin_attempts")
+        val LOCKOUT_TIER = intPreferencesKey("tamper_lockout_tier")
+        val LOCKOUT_REMAINING_MS = longPreferencesKey("tamper_lockout_remaining_ms")
     }
 
     val snapshotFlow: Flow<ShieldStatsSnapshot> =
@@ -71,8 +96,70 @@ class ShieldPreferences(private val context: Context) {
                     geminiApiKey = prefs[Keys.GEMINI_API_KEY] ?: "",
                     geminiModel = storedModel,
                     whenUnsure = UnsurePolicy.fromStored(prefs[Keys.WHEN_UNSURE]),
+                    wizardPromptedAfterOnboarding =
+                        prefs[Keys.WIZARD_PROMPTED_AFTER_ONBOARDING] ?: false,
                 )
             }
+
+    val tamperStateFlow: Flow<PersistedTamperState> =
+        context.shieldDataStore.data
+            .catch { exception ->
+                if (exception is IOException) emit(emptyPreferences()) else throw exception
+            }
+            .map { prefs -> mapToTamperState(prefs) }
+
+    override suspend fun readState(): PersistedTamperState {
+        val prefs =
+            context.shieldDataStore.data
+                .catch { exception ->
+                    if (exception is IOException) emit(emptyPreferences()) else throw exception
+                }
+                .first()
+        return mapToTamperState(prefs)
+    }
+
+    override suspend fun writeState(state: PersistedTamperState) {
+        context.shieldDataStore.edit { prefs ->
+            prefs[Keys.PIN_SALT_BASE64] = state.pinSaltBase64
+            prefs[Keys.PIN_HASH_BASE64] = state.pinHashBase64
+            prefs[Keys.WAIT_DURATION_MS] = state.waitDurationMs
+            prefs[Keys.WAIT_DURATION_CHOSEN] = state.waitDurationExplicitlyChosen
+            prefs[Keys.PROTECTION_ACTIVATED] = state.protectionActivated
+            prefs[Keys.WIZARD_PROMPTED_AFTER_ONBOARDING] = state.wizardPromptedAfterOnboarding
+            prefs[Keys.HIGHEST_WALL_CLOCK_MS] = state.highestWallClockMs
+            prefs[Keys.LAST_ELAPSED_REALTIME_MS] = state.lastElapsedRealtimeMs
+            prefs[Keys.COUNTDOWN_ACTIVE] = state.countdownActive
+            prefs[Keys.COUNTDOWN_REMAINING_MS] = state.countdownRemainingMs
+            prefs[Keys.COUNTDOWN_READY_FOR_SECOND_PIN] = state.countdownReadyForSecondPin
+            prefs[Keys.UNLOCK_WINDOW_ACTIVE] = state.unlockWindowActive
+            prefs[Keys.UNLOCK_WINDOW_REMAINING_MS] = state.unlockWindowRemainingMs
+            prefs[Keys.FAILED_PIN_ATTEMPTS] = state.failedPinAttempts
+            prefs[Keys.LOCKOUT_TIER] = state.lockoutTier
+            prefs[Keys.LOCKOUT_REMAINING_MS] = state.lockoutRemainingMs
+        }
+    }
+
+    private fun mapToTamperState(prefs: Preferences): PersistedTamperState {
+        return PersistedTamperState(
+            pinSaltBase64 = prefs[Keys.PIN_SALT_BASE64] ?: "",
+            pinHashBase64 = prefs[Keys.PIN_HASH_BASE64] ?: "",
+            waitDurationMs = prefs[Keys.WAIT_DURATION_MS] ?: WaitDurationOption.DEFAULT.durationMs,
+            waitDurationExplicitlyChosen = prefs[Keys.WAIT_DURATION_CHOSEN] ?: false,
+            protectionActivated = prefs[Keys.PROTECTION_ACTIVATED] ?: false,
+            wizardPromptedAfterOnboarding =
+                prefs[Keys.WIZARD_PROMPTED_AFTER_ONBOARDING] ?: false,
+            highestWallClockMs = prefs[Keys.HIGHEST_WALL_CLOCK_MS] ?: 0L,
+            lastElapsedRealtimeMs = prefs[Keys.LAST_ELAPSED_REALTIME_MS] ?: 0L,
+            countdownActive = prefs[Keys.COUNTDOWN_ACTIVE] ?: false,
+            countdownRemainingMs = prefs[Keys.COUNTDOWN_REMAINING_MS] ?: 0L,
+            countdownReadyForSecondPin = prefs[Keys.COUNTDOWN_READY_FOR_SECOND_PIN] ?: false,
+            unlockWindowActive = prefs[Keys.UNLOCK_WINDOW_ACTIVE] ?: false,
+            unlockWindowRemainingMs = prefs[Keys.UNLOCK_WINDOW_REMAINING_MS] ?: 0L,
+            failedPinAttempts = prefs[Keys.FAILED_PIN_ATTEMPTS] ?: 0,
+            lockoutTier = prefs[Keys.LOCKOUT_TIER] ?: 0,
+            lockoutRemainingMs = prefs[Keys.LOCKOUT_REMAINING_MS] ?: 0L,
+        )
+    }
 
     suspend fun isVpnDesiredEnabled(): Boolean {
         return snapshotFlow.first().vpnDesiredEnabled

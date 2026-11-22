@@ -66,10 +66,15 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.example.protection.ProtectionNotificationHelper
+import com.example.protection.ProtectionSystemChecker
+import com.example.ui.screens.ChangePinDialog
 import com.example.ui.screens.LogsScreen
 import com.example.ui.screens.OnboardingScreen
+import com.example.ui.screens.ProtectionWizardScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.ShieldScreen
+import com.example.ui.screens.UnlockFlowDialog
 import com.example.ui.theme.DNSShieldTheme
 import com.example.ui.viewmodel.MainViewModel
 
@@ -112,28 +117,58 @@ private val NAV_DESTINATIONS =
 
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
+    private val pendingNotificationDestination = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleIncomingIntent(intent)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
         )
         setContent {
-            DNSShieldTheme { DnsShieldApp(viewModel = viewModel) }
+            DNSShieldTheme {
+                DnsShieldApp(
+                    viewModel = viewModel,
+                    pendingDestination = pendingNotificationDestination.value,
+                    onConsumedPendingDestination = { pendingNotificationDestination.value = null },
+                )
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        val dest = intent?.getStringExtra(ProtectionNotificationHelper.EXTRA_OPEN_DESTINATION)
+        if (!dest.isNullOrBlank()) {
+            pendingNotificationDestination.value = dest
         }
     }
 }
 
 @SuppressLint("BatteryLife")
 @Composable
-private fun DnsShieldApp(viewModel: MainViewModel) {
+private fun DnsShieldApp(
+    viewModel: MainViewModel,
+    pendingDestination: String?,
+    onConsumedPendingDestination: () -> Unit,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
     var startAfterVpnGrant by remember { mutableStateOf(false) }
+    var showProtectionWizard by remember { mutableStateOf(false) }
+    var wizardOpenChecklistFirst by remember { mutableStateOf(false) }
+    var showUnlockDialog by remember { mutableStateOf(false) }
+    var showChangePinDialog by remember { mutableStateOf(false) }
+
     var notificationsGranted by remember {
         mutableStateOf(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -146,6 +181,11 @@ private fun DnsShieldApp(viewModel: MainViewModel) {
             }
         )
     }
+
+    val settingsLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            viewModel.refreshSystemPermissions()
+        }
 
     val vpnPermissionLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -191,6 +231,22 @@ private fun DnsShieldApp(viewModel: MainViewModel) {
         viewModel.clearRuleFeedback()
     }
 
+    LaunchedEffect(pendingDestination, uiState.isReady, uiState.onboardingCompleted) {
+        if (!uiState.isReady || !uiState.onboardingCompleted || pendingDestination == null) {
+            return@LaunchedEffect
+        }
+        when (pendingDestination) {
+            ProtectionNotificationHelper.DEST_CHECKLIST -> {
+                wizardOpenChecklistFirst = true
+                showProtectionWizard = true
+            }
+            ProtectionNotificationHelper.DEST_UNLOCK -> {
+                showUnlockDialog = true
+            }
+        }
+        onConsumedPendingDestination()
+    }
+
     val requestVpnPermission: (Boolean) -> Unit = { autoStart ->
         val prepareIntent = runCatching { VpnService.prepare(context) }.getOrNull()
         if (prepareIntent == null) {
@@ -233,7 +289,63 @@ private fun DnsShieldApp(viewModel: MainViewModel) {
             onRequestVpnPermission = { requestVpnPermission(false) },
             onRequestBatteryOptimization = requestBatteryOptimization,
             onRequestNotifications = requestNotifications,
-            onComplete = { activate -> viewModel.completeOnboarding(activate) },
+            onComplete = { activate ->
+                viewModel.completeOnboarding(activate)
+                if (!uiState.wizardPromptedAfterOnboarding) {
+                    wizardOpenChecklistFirst = false
+                    showProtectionWizard = true
+                }
+            },
+        )
+        return
+    }
+
+    // Also show Protection Setup Wizard right after onboarding if not yet prompted
+    LaunchedEffect(uiState.onboardingCompleted, uiState.wizardPromptedAfterOnboarding) {
+        if (uiState.onboardingCompleted && !uiState.wizardPromptedAfterOnboarding) {
+            wizardOpenChecklistFirst = false
+            showProtectionWizard = true
+        }
+    }
+
+    if (showProtectionWizard) {
+        ProtectionWizardScreen(
+            tamperState = uiState.tamperState,
+            checklist = uiState.checklistState,
+            protectionLevel = uiState.protectionLevel,
+            initialShowChecklistOnly = wizardOpenChecklistFirst,
+            onSaveInitialPin = { pin -> viewModel.setInitialPin(pin) },
+            onSelectWaitDuration = { option -> viewModel.selectWaitDuration(option) },
+            onConfirmWaitDurationStep = { viewModel.confirmWaitDurationStep() },
+            onRequestDeviceAdmin = {
+                runCatching {
+                    settingsLauncher.launch(ProtectionSystemChecker.buildDeviceAdminIntent(context))
+                }
+            },
+            onOpenAppInfo = {
+                runCatching {
+                    settingsLauncher.launch(ProtectionSystemChecker.buildAppInfoIntent(context))
+                }
+            },
+            onOpenAccessibilitySettings = {
+                runCatching {
+                    settingsLauncher.launch(ProtectionSystemChecker.buildAccessibilitySettingsIntent())
+                }
+            },
+            onOpenVpnSettings = {
+                runCatching {
+                    settingsLauncher.launch(ProtectionSystemChecker.buildVpnSettingsIntent())
+                }
+            },
+            onRequestBatteryOptimization = requestBatteryOptimization,
+            onFinish = {
+                viewModel.markWizardPromptedAfterOnboarding()
+                showProtectionWizard = false
+            },
+            onDismiss = {
+                viewModel.markWizardPromptedAfterOnboarding()
+                showProtectionWizard = false
+            },
         )
         return
     }
@@ -316,7 +428,11 @@ private fun DnsShieldApp(viewModel: MainViewModel) {
                             uiState = uiState,
                             onToggleVpn = {
                                 if (uiState.isVpnRunning) {
-                                    viewModel.stopVpn()
+                                    if (!uiState.tamperState.canTurnOffVpnDirectly) {
+                                        showUnlockDialog = true
+                                    } else {
+                                        viewModel.stopVpn()
+                                    }
                                 } else {
                                     if (
                                         Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -330,6 +446,13 @@ private fun DnsShieldApp(viewModel: MainViewModel) {
                                 }
                             },
                             onRunSelfTest = { viewModel.runSelfTest() },
+                            onOpenProtectionChecklist = {
+                                wizardOpenChecklistFirst = uiState.tamperState.protectionSetupDone
+                                showProtectionWizard = true
+                            },
+                            onOpenUnlockFlow = { showUnlockDialog = true },
+                            onCancelTurnOffRequest = { viewModel.cancelTurnOffRequest() },
+                            onLockAgain = { viewModel.lockProtectionAgain() },
                         )
                     }
                     composable(ROUTE_LOGS) {
@@ -359,10 +482,40 @@ private fun DnsShieldApp(viewModel: MainViewModel) {
                             },
                             onRemoveRule = { domain -> viewModel.removeCustomRule(domain) },
                             onRequestBatteryOptimization = requestBatteryOptimization,
+                            onOpenProtectionWizard = {
+                                wizardOpenChecklistFirst = false
+                                showProtectionWizard = true
+                            },
+                            onOpenUnlockFlow = { showUnlockDialog = true },
+                            onOpenChangePin = { showChangePinDialog = true },
+                            onSelectWaitDuration = { option -> viewModel.selectWaitDuration(option) },
+                            onShowFeedback = { msg -> viewModel.showFeedback(msg) },
                         )
                     }
                 }
             }
         }
+    }
+
+    if (showUnlockDialog) {
+        UnlockFlowDialog(
+            tamperState = uiState.tamperState,
+            onRequestTurnOff = { pin -> viewModel.requestTurnOffProtection(pin) },
+            onConfirmUnlockWindow = { pin -> viewModel.confirmUnlockWindow(pin) },
+            onCancelRequest = { viewModel.cancelTurnOffRequest() },
+            onLockAgain = { viewModel.lockProtectionAgain() },
+            onDeactivateProtection = { viewModel.deactivateProtectionInUnlockWindow() },
+            formatError = { res -> viewModel.formatActionError(res) },
+            onDismiss = { showUnlockDialog = false },
+        )
+    }
+
+    if (showChangePinDialog) {
+        ChangePinDialog(
+            tamperState = uiState.tamperState,
+            onChangePin = { cur, newPin -> viewModel.changePin(cur, newPin) },
+            formatError = { res -> viewModel.formatActionError(res) },
+            onDismiss = { showChangePinDialog = false },
+        )
     }
 }
